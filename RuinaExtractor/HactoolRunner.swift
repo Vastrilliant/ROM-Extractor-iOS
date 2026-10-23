@@ -18,12 +18,34 @@ enum HactoolRunner {
                     hactool_run(Int32(argv.count), buf.baseAddress, home.path, logURL.path)
                 }
                 for p in cargs { free(p) }
-                let data = (try? Data(contentsOf: logURL)) ?? Data()
-                cont.resume(returning: Result(code: code, log: String(decoding: data, as: UTF8.self)))
+                let log = Self.readLogTail(logURL)
+                cont.resume(returning: Result(code: code, log: log))
             }
-            thread.stackSize = 16 * 1024 * 1024
+            thread.stackSize = 4 * 1024 * 1024
             thread.qualityOfService = .userInitiated
             thread.start()
+        }
+    }
+
+    private static func readLogTail(_ url: URL, limit: UInt64 = 64 * 1024) -> String {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return "" }
+        defer { try? handle.close() }
+
+        let end: UInt64
+        do {
+            end = try handle.seekToEnd()
+        } catch {
+            return ""
+        }
+
+        let start = end > limit ? end - limit : 0
+        do {
+            try handle.seek(toOffset: start)
+            let data = try handle.read(upToCount: Int(end - start)) ?? Data()
+            let prefix = start > 0 ? "[Earlier log output omitted]\n" : ""
+            return prefix + String(decoding: data, as: UTF8.self)
+        } catch {
+            return ""
         }
     }
 }

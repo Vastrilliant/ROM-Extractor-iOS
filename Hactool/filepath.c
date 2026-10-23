@@ -85,22 +85,53 @@ void filepath_append(filepath_t *fpath, const char *format, ...) {
     filepath_update(fpath);
 }
 
+void filepath_append_bytes_n(filepath_t *fpath, const char *bytes, uint32_t n) {
+    if (fpath->valid == VALIDITY_INVALID) return;
+    if (bytes == NULL || n > MAX_PATH || memchr(bytes, '\0', n) != NULL ||
+        memchr(bytes, '/', n) != NULL || memchr(bytes, '\\', n) != NULL ||
+        (n == 1 && bytes[0] == '.') || (n == 2 && bytes[0] == '.' && bytes[1] == '.')) {
+        fpath->valid = VALIDITY_INVALID;
+        memset(fpath->os_path, 0, sizeof(fpath->os_path));
+        return;
+    }
+
+    size_t current_length = strnlen(fpath->char_path, sizeof(fpath->char_path));
+    size_t separator_length = strlen(OS_PATH_SEPARATOR);
+    if (current_length >= sizeof(fpath->char_path) ||
+        current_length + separator_length + n >= sizeof(fpath->char_path)) {
+        fpath->valid = VALIDITY_INVALID;
+        memset(fpath->os_path, 0, sizeof(fpath->os_path));
+        return;
+    }
+
+    memcpy(fpath->char_path + current_length, OS_PATH_SEPARATOR, separator_length);
+    current_length += separator_length;
+    memcpy(fpath->char_path + current_length, bytes, n);
+    current_length += n;
+    fpath->char_path[current_length] = '\0';
+    filepath_update(fpath);
+}
+
 void filepath_append_n(filepath_t *fpath, uint32_t n, const char *format, ...) {
     char tmppath[MAX_PATH];
     va_list args;
 
-    if (fpath->valid == VALIDITY_INVALID || n > MAX_PATH)
+    if (fpath->valid == VALIDITY_INVALID || format == NULL) return;
+    if (strcmp(format, "%s") == 0) {
+        va_start(args, format);
+        const char *value = va_arg(args, const char *);
+        va_end(args);
+        filepath_append_bytes_n(fpath, value, n);
         return;
+    }
 
-    memset(tmppath, 0, MAX_PATH);
-
+    memset(tmppath, 0, sizeof(tmppath));
     va_start(args, format);
     vsnprintf(tmppath, sizeof(tmppath), format, args);
     va_end(args);
-
-    strcat(fpath->char_path, OS_PATH_SEPARATOR);
-    strncat(fpath->char_path, tmppath, n);
-    filepath_update(fpath);
+    size_t formatted_length = strnlen(tmppath, sizeof(tmppath));
+    if (n > formatted_length) n = (uint32_t)formatted_length;
+    filepath_append_bytes_n(fpath, tmppath, n);
 }
 
 void filepath_set(filepath_t *fpath, const char *path) {

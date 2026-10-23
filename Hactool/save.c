@@ -863,7 +863,7 @@ static int save_visit_save_file(save_ctx_t *ctx, uint32_t file_index, filepath_t
 
     filepath_copy(cur_path, dir_path);
     if (name_size) {
-        filepath_append_n(cur_path, name_size, "%s", entry.name);
+        filepath_append_bytes_n(cur_path, entry.name, name_size);
     }
 
     int found_file = 1;
@@ -899,7 +899,7 @@ static int save_visit_save_dir(save_ctx_t *ctx, uint32_t dir_index, filepath_t *
 
     filepath_copy(cur_path, parent_path);
     if (name_size) {
-        filepath_append_n(cur_path, name_size, "%s", entry.name);
+        filepath_append_bytes_n(cur_path, entry.name, name_size);
     }
 
     /* If we're actually extracting the romfs, make directory. */

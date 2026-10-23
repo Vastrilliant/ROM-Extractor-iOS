@@ -1,5 +1,8 @@
 #include "ios_shim.h"
 #include <stdlib.h>
+#include <limits.h>
+#include <sys/mman.h>
+#include <unistd.h>
 #include "nca.h"
 #include "aes.h"
 #include "pki.h"
@@ -272,6 +275,67 @@ size_t nca_section_fread(nca_section_ctx_t *ctx, void *buffer, size_t count) {
     return read;
 }
 
+static void *nca_allocate_file_backed_table(uint64_t requested_size, FILE **backing_file) {
+    if (requested_size == 0) return NULL;
+    if (requested_size > SIZE_MAX || requested_size > INT64_MAX) {
+        fprintf(stderr, "RomFS metadata table is too large to map!\n");
+        exit(EXIT_FAILURE);
+    }
+
+    FILE *file = tmpfile();
+    if (file == NULL) {
+        fprintf(stderr, "Failed to create temporary metadata backing file!\n");
+        exit(EXIT_FAILURE);
+    }
+    if (ftruncate(fileno(file), (off_t)requested_size) != 0) {
+        fprintf(stderr, "Failed to size temporary metadata backing file!\n");
+        fclose(file);
+        exit(EXIT_FAILURE);
+    }
+
+    void *mapping = mmap(NULL, (size_t)requested_size, PROT_READ | PROT_WRITE, MAP_SHARED, fileno(file), 0);
+    if (mapping == MAP_FAILED) {
+        fprintf(stderr, "Failed to map RomFS metadata table!\n");
+        fclose(file);
+        exit(EXIT_FAILURE);
+    }
+    *backing_file = file;
+    return mapping;
+}
+
+static void nca_sync_file_backed_table(void *mapping, size_t size) {
+    if (mapping != NULL && size != 0 && msync(mapping, size, MS_SYNC) != 0) {
+        fprintf(stderr, "Failed to flush mapped RomFS metadata table!\n");
+        exit(EXIT_FAILURE);
+    }
+}
+
+static uint64_t nca_read_file_backed_table(nca_section_ctx_t *ctx, uint64_t source_offset, void *mapping, size_t size) {
+    size_t completed = 0;
+    const size_t chunk_limit = 0x100000;
+    while (completed < size) {
+        size_t chunk = size - completed;
+        if (chunk > chunk_limit) chunk = chunk_limit;
+        if (source_offset > UINT64_MAX - completed) return completed;
+        nca_section_fseek(ctx, source_offset + completed);
+        uint64_t read = nca_section_fread(ctx, (char *)mapping + completed, chunk);
+        if (read != chunk) return completed + read;
+        nca_sync_file_backed_table((char *)mapping + completed, chunk);
+        completed += chunk;
+    }
+    return completed;
+}
+
+static void nca_release_file_backed_table(void *mapping, size_t size, FILE **backing_file) {
+    if (backing_file != NULL && *backing_file != NULL) {
+        if (mapping != NULL && size != 0) munmap(mapping, size);
+        fclose(*backing_file);
+        *backing_file = NULL;
+    } else if (mapping != NULL) {
+        free(mapping);
+    }
+}
+
 void nca_free_section_contexts(nca_ctx_t *ctx) {
     for (unsigned int i = 0; i < 4; i++) {
         if (ctx->section_contexts[i].is_present) {
@@ -281,19 +345,19 @@ void nca_free_section_contexts(nca_ctx_t *ctx) {
             if (ctx->section_contexts[i].type == PFS0 && ctx->section_contexts[i].pfs0_ctx.is_exefs) {
                 free(ctx->section_contexts[i].pfs0_ctx.npdm);
             } else if (ctx->section_contexts[i].type == ROMFS) {
-                if (ctx->section_contexts[i].romfs_ctx.directories) {
-                    free(ctx->section_contexts[i].romfs_ctx.directories);
-                }
-                if (ctx->section_contexts[i].romfs_ctx.files) {
-                    free(ctx->section_contexts[i].romfs_ctx.files);
-                }
+                nca_release_file_backed_table(ctx->section_contexts[i].romfs_ctx.directories,
+                    ctx->section_contexts[i].romfs_ctx.directories_size,
+                    &ctx->section_contexts[i].romfs_ctx.directories_backing);
+                nca_release_file_backed_table(ctx->section_contexts[i].romfs_ctx.files,
+                    ctx->section_contexts[i].romfs_ctx.files_size,
+                    &ctx->section_contexts[i].romfs_ctx.files_backing);
             }  else if (ctx->section_contexts[i].type == NCA0_ROMFS) {
-                if (ctx->section_contexts[i].nca0_romfs_ctx.directories) {
-                    free(ctx->section_contexts[i].nca0_romfs_ctx.directories);
-                }
-                if (ctx->section_contexts[i].nca0_romfs_ctx.files) {
-                    free(ctx->section_contexts[i].nca0_romfs_ctx.files);
-                }
+                nca_release_file_backed_table(ctx->section_contexts[i].nca0_romfs_ctx.directories,
+                    ctx->section_contexts[i].nca0_romfs_ctx.directories_size,
+                    &ctx->section_contexts[i].nca0_romfs_ctx.directories_backing);
+                nca_release_file_backed_table(ctx->section_contexts[i].nca0_romfs_ctx.files,
+                    ctx->section_contexts[i].nca0_romfs_ctx.files_size,
+                    &ctx->section_contexts[i].nca0_romfs_ctx.files_backing);
             } else if (ctx->section_contexts[i].type == BKTR) {
                 if (ctx->section_contexts[i].bktr_ctx.subsection_block) {
                     free(ctx->section_contexts[i].bktr_ctx.subsection_block);
@@ -301,12 +365,12 @@ void nca_free_section_contexts(nca_ctx_t *ctx) {
                 if (ctx->section_contexts[i].bktr_ctx.relocation_block) {
                     free(ctx->section_contexts[i].bktr_ctx.relocation_block);
                 }
-                if (ctx->section_contexts[i].bktr_ctx.directories) {
-                    free(ctx->section_contexts[i].bktr_ctx.directories);
-                }
-                if (ctx->section_contexts[i].bktr_ctx.files) {
-                    free(ctx->section_contexts[i].bktr_ctx.files);
-                }
+                nca_release_file_backed_table(ctx->section_contexts[i].bktr_ctx.directories,
+                    ctx->section_contexts[i].bktr_ctx.directories_size,
+                    &ctx->section_contexts[i].bktr_ctx.directories_backing);
+                nca_release_file_backed_table(ctx->section_contexts[i].bktr_ctx.files,
+                    ctx->section_contexts[i].bktr_ctx.files_size,
+                    &ctx->section_contexts[i].bktr_ctx.files_backing);
             }
         }
     }
@@ -363,9 +427,10 @@ static void nca_save(nca_ctx_t *ctx) {
                 exit(EXIT_FAILURE);
             }
 
-            unsigned char *buf = malloc(0x400000);
+            unsigned char *buf = malloc(0x100000);
             if (buf == NULL) {
                 fprintf(stderr, "Failed to allocate file-save buffer!\n");
+                fclose(f_dec);
                 exit(EXIT_FAILURE);
             }
             for (unsigned int i = 0; i < 4; i++) {
@@ -373,9 +438,8 @@ static void nca_save(nca_ctx_t *ctx) {
                     fseeko64(f_dec, ctx->section_contexts[i].offset, SEEK_SET);
                     ctx->section_contexts[i].physical_reads = 1;
 
-                    uint64_t read_size = 0x400000; /* 4 MB buffer. */
-                    memset(buf, 0xCC, read_size); /* Debug in case I fuck this up somehow... */
-                    uint64_t ofs = 0;
+                    uint64_t read_size = 0x100000; /* 1 MB buffer. */
+            uint64_t ofs = 0;
                     uint64_t end_ofs = ofs + ctx->section_contexts[i].size;
                     nca_section_fseek(&ctx->section_contexts[i], ofs);
                     while (ofs < end_ofs) {
@@ -1044,6 +1108,70 @@ void nca_process_pfs0_section(nca_section_ctx_t *ctx) {
 }
 
 
+static int nca_romfs_span_valid(uint64_t offset, uint64_t size, uint64_t region_size) {
+    return offset <= region_size && size <= region_size - offset;
+}
+
+static void nca_validate_romfs_layout(const romfs_hdr_t *header, uint64_t region_size, const char *label) {
+    int valid = header->header_size == ROMFS_HEADER_SIZE && region_size >= ROMFS_HEADER_SIZE &&
+        nca_romfs_span_valid(header->dir_hash_table_offset, header->dir_hash_table_size, region_size) &&
+        nca_romfs_span_valid(header->dir_meta_table_offset, header->dir_meta_table_size, region_size) &&
+        nca_romfs_span_valid(header->file_hash_table_offset, header->file_hash_table_size, region_size) &&
+        nca_romfs_span_valid(header->file_meta_table_offset, header->file_meta_table_size, region_size) &&
+        header->dir_meta_table_size >= sizeof(romfs_direntry_t) &&
+        header->data_offset >= header->header_size && header->data_offset <= region_size;
+    if (valid) {
+        const uint64_t offsets[] = {
+            header->dir_hash_table_offset, header->dir_meta_table_offset,
+            header->file_hash_table_offset, header->file_meta_table_offset
+        };
+        const uint64_t sizes[] = {
+            header->dir_hash_table_size, header->dir_meta_table_size,
+            header->file_hash_table_size, header->file_meta_table_size
+        };
+        for (size_t i = 0; i < sizeof(offsets) / sizeof(offsets[0]); i++) {
+            if (sizes[i] != 0 && offsets[i] < header->header_size) {
+                valid = 0;
+                break;
+            }
+        }
+    }
+    if (!valid) {
+        fprintf(stderr, "Invalid %s RomFS metadata layout!\n", label);
+        exit(EXIT_FAILURE);
+    }
+}
+
+static void nca_validate_nca0_romfs_layout(const nca0_romfs_hdr_t *header, uint64_t region_size) {
+    int valid = header->header_size == NCA0_ROMFS_HEADER_SIZE && region_size >= NCA0_ROMFS_HEADER_SIZE &&
+        nca_romfs_span_valid(header->dir_hash_table_offset, header->dir_hash_table_size, region_size) &&
+        nca_romfs_span_valid(header->dir_meta_table_offset, header->dir_meta_table_size, region_size) &&
+        nca_romfs_span_valid(header->file_hash_table_offset, header->file_hash_table_size, region_size) &&
+        nca_romfs_span_valid(header->file_meta_table_offset, header->file_meta_table_size, region_size) &&
+        header->dir_meta_table_size >= sizeof(romfs_direntry_t) &&
+        header->data_offset >= header->header_size && header->data_offset <= region_size;
+    if (valid) {
+        const uint64_t offsets[] = {
+            header->dir_hash_table_offset, header->dir_meta_table_offset,
+            header->file_hash_table_offset, header->file_meta_table_offset
+        };
+        const uint64_t sizes[] = {
+            header->dir_hash_table_size, header->dir_meta_table_size,
+            header->file_hash_table_size, header->file_meta_table_size
+        };
+        for (size_t i = 0; i < sizeof(offsets) / sizeof(offsets[0]); i++) {
+            if (sizes[i] != 0 && offsets[i] < header->header_size) {
+                valid = 0;
+                break;
+            }
+        }
+    }
+    if (!valid) {
+        fprintf(stderr, "Invalid NCA0 RomFS metadata layout!\n");
+        exit(EXIT_FAILURE);
+    }
+}
+
 void nca_process_ivfc_section(nca_section_ctx_t *ctx) {
     romfs_superblock_t *sb = ctx->romfs_ctx.superblock;
     for (unsigned int i = 0; i < IVFC_MAX_LEVEL; i++) {
@@ -1069,34 +1197,49 @@ void nca_process_ivfc_section(nca_section_ctx_t *ctx) {
     }
 
     ctx->romfs_ctx.romfs_offset = ctx->romfs_ctx.ivfc_levels[IVFC_MAX_LEVEL - 1].data_offset;
+    if (!nca_romfs_span_valid(ctx->romfs_ctx.romfs_offset,
+        ctx->romfs_ctx.ivfc_levels[IVFC_MAX_LEVEL - 1].data_size, ctx->size)) {
+        fprintf(stderr, "Invalid NCA RomFS section bounds!\n");
+        exit(EXIT_FAILURE);
+    }
     nca_section_fseek(ctx, ctx->romfs_ctx.romfs_offset);
     if (nca_section_fread(ctx, &ctx->romfs_ctx.header, sizeof(romfs_hdr_t)) != sizeof(romfs_hdr_t)) {
         fprintf(stderr, "Failed to read RomFS header!\n");
+        exit(EXIT_FAILURE);
     }
 
     if ((ctx->tool_ctx->action & (ACTION_EXTRACT | ACTION_LISTROMFS)) && ctx->romfs_ctx.header.header_size == ROMFS_HEADER_SIZE) {
-        /* Pre-load the file/data entry caches. */
-        ctx->romfs_ctx.directories = calloc(1, ctx->romfs_ctx.header.dir_meta_table_size);
+        uint64_t region_size = ctx->romfs_ctx.ivfc_levels[IVFC_MAX_LEVEL - 1].data_size;
+        nca_validate_romfs_layout(&ctx->romfs_ctx.header, region_size, "NCA");
+        ctx->romfs_ctx.directories_size = (size_t)ctx->romfs_ctx.header.dir_meta_table_size;
+        ctx->romfs_ctx.directories = nca_allocate_file_backed_table(ctx->romfs_ctx.header.dir_meta_table_size,
+            &ctx->romfs_ctx.directories_backing);
         if (ctx->romfs_ctx.directories == NULL) {
             fprintf(stderr, "Failed to allocate RomFS directory cache!\n");
             exit(EXIT_FAILURE);
         }
 
-        nca_section_fseek(ctx, ctx->romfs_ctx.romfs_offset + ctx->romfs_ctx.header.dir_meta_table_offset);
-        if (nca_section_fread(ctx, ctx->romfs_ctx.directories, ctx->romfs_ctx.header.dir_meta_table_size) != ctx->romfs_ctx.header.dir_meta_table_size) {
+        if (nca_read_file_backed_table(ctx,
+            ctx->romfs_ctx.romfs_offset + ctx->romfs_ctx.header.dir_meta_table_offset,
+            ctx->romfs_ctx.directories, ctx->romfs_ctx.directories_size) != ctx->romfs_ctx.header.dir_meta_table_size) {
             fprintf(stderr, "Failed to read RomFS directory cache!\n");
             exit(EXIT_FAILURE);
         }
 
-        ctx->romfs_ctx.files = calloc(1, ctx->romfs_ctx.header.file_meta_table_size);
-        if (ctx->romfs_ctx.files == NULL) {
-            fprintf(stderr, "Failed to allocate RomFS file cache!\n");
-            exit(EXIT_FAILURE);
-        }
-        nca_section_fseek(ctx, ctx->romfs_ctx.romfs_offset + ctx->romfs_ctx.header.file_meta_table_offset);
-        if (nca_section_fread(ctx, ctx->romfs_ctx.files, ctx->romfs_ctx.header.file_meta_table_size) != ctx->romfs_ctx.header.file_meta_table_size) {
-            fprintf(stderr, "Failed to read RomFS file cache!\n");
-            exit(EXIT_FAILURE);
+        if (ctx->romfs_ctx.header.file_meta_table_size != 0) {
+            ctx->romfs_ctx.files_size = (size_t)ctx->romfs_ctx.header.file_meta_table_size;
+            ctx->romfs_ctx.files = nca_allocate_file_backed_table(ctx->romfs_ctx.header.file_meta_table_size,
+                &ctx->romfs_ctx.files_backing);
+            if (ctx->romfs_ctx.files == NULL) {
+                fprintf(stderr, "Failed to allocate RomFS file cache!\n");
+                exit(EXIT_FAILURE);
+            }
+            if (nca_read_file_backed_table(ctx,
+                ctx->romfs_ctx.romfs_offset + ctx->romfs_ctx.header.file_meta_table_offset,
+                ctx->romfs_ctx.files, ctx->romfs_ctx.files_size) != ctx->romfs_ctx.header.file_meta_table_size) {
+                fprintf(stderr, "Failed to read RomFS file cache!\n");
+                exit(EXIT_FAILURE);
+            }
         }
     }
 }
@@ -1113,34 +1256,48 @@ void nca_process_nca0_romfs_section(nca_section_ctx_t *ctx) {
     if (ctx->superblock_hash_validity != VALIDITY_VALID) return;
 
     ctx->nca0_romfs_ctx.romfs_offset = sb->romfs_offset;
+    if (!nca_romfs_span_valid(ctx->nca0_romfs_ctx.romfs_offset, sb->romfs_size, ctx->size)) {
+        fprintf(stderr, "Invalid NCA0 RomFS section bounds!\n");
+        exit(EXIT_FAILURE);
+    }
     nca_section_fseek(ctx, ctx->nca0_romfs_ctx.romfs_offset);
     if (nca_section_fread(ctx, &ctx->nca0_romfs_ctx.header, sizeof(nca0_romfs_hdr_t)) != sizeof(nca0_romfs_hdr_t)) {
         fprintf(stderr, "Failed to read NCA0 RomFS header!\n");
+        exit(EXIT_FAILURE);
     }
 
     if ((ctx->tool_ctx->action & (ACTION_EXTRACT | ACTION_LISTROMFS)) && ctx->nca0_romfs_ctx.header.header_size == NCA0_ROMFS_HEADER_SIZE) {
-        /* Pre-load the file/data entry caches. */
-        ctx->nca0_romfs_ctx.directories = calloc(1, ctx->nca0_romfs_ctx.header.dir_meta_table_size);
+        uint64_t region_size = ctx->nca0_romfs_ctx.superblock->romfs_size;
+        nca_validate_nca0_romfs_layout(&ctx->nca0_romfs_ctx.header, region_size);
+        ctx->nca0_romfs_ctx.directories_size = (size_t)ctx->nca0_romfs_ctx.header.dir_meta_table_size;
+        ctx->nca0_romfs_ctx.directories = nca_allocate_file_backed_table(ctx->nca0_romfs_ctx.header.dir_meta_table_size,
+            &ctx->nca0_romfs_ctx.directories_backing);
         if (ctx->nca0_romfs_ctx.directories == NULL) {
             fprintf(stderr, "Failed to allocate NCA0 RomFS directory cache!\n");
             exit(EXIT_FAILURE);
         }
 
-        nca_section_fseek(ctx, ctx->nca0_romfs_ctx.romfs_offset + ctx->nca0_romfs_ctx.header.dir_meta_table_offset);
-        if (nca_section_fread(ctx, ctx->nca0_romfs_ctx.directories, ctx->nca0_romfs_ctx.header.dir_meta_table_size) != ctx->nca0_romfs_ctx.header.dir_meta_table_size) {
+        if (nca_read_file_backed_table(ctx,
+            ctx->nca0_romfs_ctx.romfs_offset + ctx->nca0_romfs_ctx.header.dir_meta_table_offset,
+            ctx->nca0_romfs_ctx.directories, ctx->nca0_romfs_ctx.directories_size) != ctx->nca0_romfs_ctx.header.dir_meta_table_size) {
             fprintf(stderr, "Failed to read NCA0 RomFS directory cache!\n");
             exit(EXIT_FAILURE);
         }
 
-        ctx->nca0_romfs_ctx.files = calloc(1, ctx->nca0_romfs_ctx.header.file_meta_table_size);
-        if (ctx->nca0_romfs_ctx.files == NULL) {
-            fprintf(stderr, "Failed to allocate NCA0 RomFS file cache!\n");
-            exit(EXIT_FAILURE);
-        }
-        nca_section_fseek(ctx, ctx->nca0_romfs_ctx.romfs_offset + ctx->nca0_romfs_ctx.header.file_meta_table_offset);
-        if (nca_section_fread(ctx, ctx->nca0_romfs_ctx.files, ctx->nca0_romfs_ctx.header.file_meta_table_size) != ctx->nca0_romfs_ctx.header.file_meta_table_size) {
-            fprintf(stderr, "Failed to read NCA0 RomFS file cache!\n");
-            exit(EXIT_FAILURE);
+        if (ctx->nca0_romfs_ctx.header.file_meta_table_size != 0) {
+            ctx->nca0_romfs_ctx.files_size = (size_t)ctx->nca0_romfs_ctx.header.file_meta_table_size;
+            ctx->nca0_romfs_ctx.files = nca_allocate_file_backed_table(ctx->nca0_romfs_ctx.header.file_meta_table_size,
+                &ctx->nca0_romfs_ctx.files_backing);
+            if (ctx->nca0_romfs_ctx.files == NULL) {
+                fprintf(stderr, "Failed to allocate NCA0 RomFS file cache!\n");
+                exit(EXIT_FAILURE);
+            }
+            if (nca_read_file_backed_table(ctx,
+                ctx->nca0_romfs_ctx.romfs_offset + ctx->nca0_romfs_ctx.header.file_meta_table_offset,
+                ctx->nca0_romfs_ctx.files, ctx->nca0_romfs_ctx.files_size) != ctx->nca0_romfs_ctx.header.file_meta_table_size) {
+                fprintf(stderr, "Failed to read NCA0 RomFS file cache!\n");
+                exit(EXIT_FAILURE);
+            }
         }
     }
 }
@@ -1246,27 +1403,36 @@ void nca_process_bktr_section(nca_section_ctx_t *ctx) {
             }
 
             if ((ctx->tool_ctx->action & (ACTION_EXTRACT | ACTION_LISTROMFS)) && ctx->bktr_ctx.header.header_size == ROMFS_HEADER_SIZE) {
-                /* Pre-load the file/data entry caches. */
-                ctx->bktr_ctx.directories = calloc(1, ctx->bktr_ctx.header.dir_meta_table_size);
+                uint64_t region_size = ctx->bktr_ctx.ivfc_levels[IVFC_MAX_LEVEL - 1].data_size;
+                nca_validate_romfs_layout(&ctx->bktr_ctx.header, region_size, "BKTR");
+                ctx->bktr_ctx.directories_size = (size_t)ctx->bktr_ctx.header.dir_meta_table_size;
+                ctx->bktr_ctx.directories = nca_allocate_file_backed_table(ctx->bktr_ctx.header.dir_meta_table_size,
+                    &ctx->bktr_ctx.directories_backing);
                 if (ctx->bktr_ctx.directories == NULL) {
                     fprintf(stderr, "Failed to allocate RomFS directory cache!\n");
                     exit(EXIT_FAILURE);
                 }
 
-                nca_section_fseek(ctx, ctx->bktr_ctx.romfs_offset + ctx->bktr_ctx.header.dir_meta_table_offset);
-                if (nca_section_fread(ctx, ctx->bktr_ctx.directories, ctx->bktr_ctx.header.dir_meta_table_size) != ctx->bktr_ctx.header.dir_meta_table_size) {
+                if (nca_read_file_backed_table(ctx,
+                    ctx->bktr_ctx.romfs_offset + ctx->bktr_ctx.header.dir_meta_table_offset,
+                    ctx->bktr_ctx.directories, ctx->bktr_ctx.directories_size) != ctx->bktr_ctx.header.dir_meta_table_size) {
                     fprintf(stderr, "Failed to read RomFS directory cache!\n");
                     exit(EXIT_FAILURE);
                 }
-                ctx->bktr_ctx.files = calloc(1, ctx->bktr_ctx.header.file_meta_table_size);
-                if (ctx->bktr_ctx.files == NULL) {
-                    fprintf(stderr, "Failed to allocate RomFS file cache!\n");
-                    exit(EXIT_FAILURE);
-                }
-                nca_section_fseek(ctx, ctx->bktr_ctx.romfs_offset + ctx->bktr_ctx.header.file_meta_table_offset);
-                if (nca_section_fread(ctx, ctx->bktr_ctx.files, ctx->bktr_ctx.header.file_meta_table_size) != ctx->bktr_ctx.header.file_meta_table_size) {
-                    fprintf(stderr, "Failed to read RomFS file cache!\n");
-                    exit(EXIT_FAILURE);
+                if (ctx->bktr_ctx.header.file_meta_table_size != 0) {
+                    ctx->bktr_ctx.files_size = (size_t)ctx->bktr_ctx.header.file_meta_table_size;
+                    ctx->bktr_ctx.files = nca_allocate_file_backed_table(ctx->bktr_ctx.header.file_meta_table_size,
+                        &ctx->bktr_ctx.files_backing);
+                    if (ctx->bktr_ctx.files == NULL) {
+                        fprintf(stderr, "Failed to allocate RomFS file cache!\n");
+                        exit(EXIT_FAILURE);
+                    }
+                    if (nca_read_file_backed_table(ctx,
+                        ctx->bktr_ctx.romfs_offset + ctx->bktr_ctx.header.file_meta_table_offset,
+                        ctx->bktr_ctx.files, ctx->bktr_ctx.files_size) != ctx->bktr_ctx.header.file_meta_table_size) {
+                        fprintf(stderr, "Failed to read RomFS file cache!\n");
+                        exit(EXIT_FAILURE);
+                    }
                 }
             }
         }
@@ -1367,6 +1533,11 @@ void nca_print_bktr_section(nca_section_ctx_t *ctx) {
 }
 
 void nca_save_section_file(nca_section_ctx_t *ctx, uint64_t ofs, uint64_t total_size, filepath_t *filepath) {
+    if (filepath == NULL || filepath->valid != VALIDITY_VALID) {
+        fprintf(stderr, "Skipping invalid RomFS output path.\n");
+        return;
+    }
+
     FILE *f_out = os_fopen(filepath->os_path, OS_MODE_WRITE);
 
     if (f_out == NULL) {
@@ -1374,13 +1545,13 @@ void nca_save_section_file(nca_section_ctx_t *ctx, uint64_t ofs, uint64_t total_
         return;
     }
 
-    uint64_t read_size = 0x400000; /* 4 MB buffer. */
+    uint64_t read_size = 0x100000; /* 1 MB buffer. */
     unsigned char *buf = malloc(read_size);
     if (buf == NULL) {
         fprintf(stderr, "Failed to allocate file-save buffer!\n");
+        fclose(f_out);
         exit(EXIT_FAILURE);
     }
-    memset(buf, 0xCC, read_size); /* Debug in case I fuck this up somehow... */
     uint64_t end_ofs = ofs + total_size;
     while (ofs < end_ofs) {
         nca_section_fseek(ctx, ofs);
@@ -1538,6 +1709,50 @@ static int nca_is_romfs_file_updated(nca_section_ctx_t *ctx, uint64_t file_offse
     return 0;
 }
 
+static uint64_t nca_romfs_dir_table_size(nca_section_ctx_t *ctx) {
+    return ctx->type == ROMFS ? ctx->romfs_ctx.header.dir_meta_table_size : ctx->bktr_ctx.header.dir_meta_table_size;
+}
+
+static uint64_t nca_romfs_file_table_size(nca_section_ctx_t *ctx) {
+    return ctx->type == ROMFS ? ctx->romfs_ctx.header.file_meta_table_size : ctx->bktr_ctx.header.file_meta_table_size;
+}
+
+static uint64_t nca_romfs_region_size(nca_section_ctx_t *ctx) {
+    return ctx->type == ROMFS ? ctx->romfs_ctx.ivfc_levels[IVFC_MAX_LEVEL - 1].data_size : ctx->bktr_ctx.ivfc_levels[IVFC_MAX_LEVEL - 1].data_size;
+}
+
+static uint64_t nca_romfs_data_offset(nca_section_ctx_t *ctx) {
+    return ctx->type == ROMFS ? ctx->romfs_ctx.header.data_offset : ctx->bktr_ctx.header.data_offset;
+}
+
+static romfs_direntry_t *nca_checked_romfs_direntry(nca_section_ctx_t *ctx, uint32_t offset) {
+    uint64_t table_size = nca_romfs_dir_table_size(ctx);
+    if (offset == ROMFS_ENTRY_EMPTY || offset > table_size || table_size - offset < sizeof(romfs_direntry_t)) {
+        fprintf(stderr, "Invalid RomFS directory entry offset!\n");
+        exit(EXIT_FAILURE);
+    }
+    romfs_direntry_t *entry = romfs_get_direntry(ctx->type == ROMFS ? ctx->romfs_ctx.directories : ctx->bktr_ctx.directories, offset);
+    if (entry->name_size > table_size - offset - sizeof(romfs_direntry_t) || entry->name_size > MAX_PATH) {
+        fprintf(stderr, "Invalid RomFS directory name bounds!\n");
+        exit(EXIT_FAILURE);
+    }
+    return entry;
+}
+
+static romfs_fentry_t *nca_checked_romfs_fentry(nca_section_ctx_t *ctx, uint32_t offset) {
+    uint64_t table_size = nca_romfs_file_table_size(ctx);
+    if (offset == ROMFS_ENTRY_EMPTY || offset > table_size || table_size - offset < sizeof(romfs_fentry_t)) {
+        fprintf(stderr, "Invalid RomFS file entry offset!\n");
+        exit(EXIT_FAILURE);
+    }
+    romfs_fentry_t *entry = romfs_get_fentry(ctx->type == ROMFS ? ctx->romfs_ctx.files : ctx->bktr_ctx.files, offset);
+    if (entry->name_size > table_size - offset - sizeof(romfs_fentry_t) || entry->name_size > MAX_PATH) {
+        fprintf(stderr, "Invalid RomFS file name bounds!\n");
+        exit(EXIT_FAILURE);
+    }
+    return entry;
+}
+
 static int nca_visit_romfs_file(nca_section_ctx_t *ctx, uint32_t file_offset, filepath_t *dir_path) {
     filepath_t *cur_path = calloc(1, sizeof(filepath_t));
     if (cur_path == NULL) {
@@ -1546,32 +1761,33 @@ static int nca_visit_romfs_file(nca_section_ctx_t *ctx, uint32_t file_offset, fi
     }
 
     int found_any_file = 0;
+    uint64_t processed = 0;
+    uint64_t table_size = nca_romfs_file_table_size(ctx);
+    uint64_t max_entries = table_size / sizeof(romfs_fentry_t) + 1;
+    uint64_t region_size = nca_romfs_region_size(ctx);
+    uint64_t data_offset = nca_romfs_data_offset(ctx);
 
-    do {
-        romfs_fentry_t *entry;
-        if (ctx->type == ROMFS) {
-            entry = romfs_get_fentry(ctx->romfs_ctx.files, file_offset);
-        } else {
-            entry = romfs_get_fentry(ctx->bktr_ctx.files, file_offset);
+    while (file_offset != ROMFS_ENTRY_EMPTY) {
+        if (++processed > max_entries) {
+            fprintf(stderr, "Cyclic or invalid RomFS file sibling chain!\n");
+            free(cur_path);
+            exit(EXIT_FAILURE);
+        }
+        romfs_fentry_t *entry = nca_checked_romfs_fentry(ctx, file_offset);
+        if (data_offset > region_size || entry->offset > region_size - data_offset || entry->size > region_size - data_offset - entry->offset) {
+            fprintf(stderr, "RomFS file data lies outside the RomFS region!\n");
+            free(cur_path);
+            exit(EXIT_FAILURE);
         }
 
         filepath_copy(cur_path, dir_path);
-        if (entry->name_size) {
-            filepath_append_n(cur_path, entry->name_size, "%s", entry->name);
-        }
+        if (entry->name_size) filepath_append_bytes_n(cur_path, entry->name, entry->name_size);
 
         int found_file = 1;
-
-        /* If we're extracting... */
-        uint64_t phys_offset;
-        if (ctx->type == ROMFS) {
-            phys_offset = ctx->romfs_ctx.romfs_offset + ctx->romfs_ctx.header.data_offset + entry->offset;
-        } else {
-            phys_offset = ctx->bktr_ctx.romfs_offset + ctx->bktr_ctx.header.data_offset + entry->offset;
-        }
+        uint64_t phys_offset = (ctx->type == ROMFS ? ctx->romfs_ctx.romfs_offset : ctx->bktr_ctx.romfs_offset) + data_offset + entry->offset;
         if ((ctx->tool_ctx->action & ACTION_ONLYUPDATEDROMFS) == 0 || nca_is_romfs_file_updated(ctx, phys_offset, entry->size)) {
             if ((ctx->tool_ctx->action & ACTION_LISTROMFS) == 0) {
-                printf("Saving %s...\n", cur_path->char_path);
+                if ((processed % 1024) == 0) printf("Processed %" PRIu64 " RomFS files...\n", processed);
                 nca_save_section_file(ctx, phys_offset, entry->size, cur_path);
             } else {
                 printf("rom:%s\n", cur_path->char_path);
@@ -1581,13 +1797,129 @@ static int nca_visit_romfs_file(nca_section_ctx_t *ctx, uint32_t file_offset, fi
         }
 
         found_any_file |= found_file;
-
         file_offset = entry->sibling;
-    } while (file_offset != ROMFS_ENTRY_EMPTY);
+    }
 
     free(cur_path);
-
     return found_any_file;
+}
+
+typedef struct {
+    uint32_t next_offset;
+    filepath_t path;
+    int has_files;
+    int remove_if_empty;
+} nca_romfs_dir_frame_t;
+
+static int nca_visit_romfs_dir(nca_section_ctx_t *ctx, uint32_t dir_offset, filepath_t *parent_path) {
+    size_t capacity = 16;
+    size_t frame_count = 1;
+    uint64_t visited = 0;
+    uint64_t table_size = nca_romfs_dir_table_size(ctx);
+    uint64_t max_entries = table_size / sizeof(romfs_direntry_t) + 1;
+    nca_romfs_dir_frame_t *frames = calloc(capacity, sizeof(*frames));
+    if (frames == NULL) {
+        fprintf(stderr, "Failed to allocate RomFS traversal stack!\n");
+        exit(EXIT_FAILURE);
+    }
+    frames[0].next_offset = dir_offset;
+    filepath_copy(&frames[0].path, parent_path);
+
+    int result = 0;
+    while (frame_count > 0) {
+        nca_romfs_dir_frame_t *frame = &frames[frame_count - 1];
+        if (frame->next_offset == ROMFS_ENTRY_EMPTY) {
+            int subtree_has_files = frame->has_files;
+            if (frame->remove_if_empty && !subtree_has_files && ctx->type == BKTR &&
+                (ctx->tool_ctx->action & ACTION_ONLYUPDATEDROMFS)) {
+                os_rmdir(frame->path.os_path);
+            }
+            frame_count--;
+            if (frame_count > 0) frames[frame_count - 1].has_files |= subtree_has_files;
+            else result = subtree_has_files;
+            continue;
+        }
+
+        uint32_t current_offset = frame->next_offset;
+        romfs_direntry_t *entry = nca_checked_romfs_direntry(ctx, current_offset);
+        frame->next_offset = entry->sibling;
+        if (++visited > max_entries) {
+            fprintf(stderr, "Cyclic or invalid RomFS directory graph!\n");
+            free(frames);
+            exit(EXIT_FAILURE);
+        }
+
+        filepath_t cur_path;
+        filepath_copy(&cur_path, &frame->path);
+        if (entry->name_size) filepath_append_bytes_n(&cur_path, entry->name, entry->name_size);
+        if ((ctx->tool_ctx->action & ACTION_LISTROMFS) == 0) os_makedir(cur_path.os_path);
+
+        int direct_files = 0;
+        if (entry->file != ROMFS_ENTRY_EMPTY) direct_files = nca_visit_romfs_file(ctx, entry->file, &cur_path);
+
+        if (entry->child != ROMFS_ENTRY_EMPTY) {
+            if (frame_count >= MAX_PATH) {
+                fprintf(stderr, "RomFS directory nesting exceeds the supported path depth!\n");
+                free(frames);
+                exit(EXIT_FAILURE);
+            }
+            if (frame_count == capacity) {
+                size_t next_capacity = capacity * 2;
+                if (next_capacity > MAX_PATH) next_capacity = MAX_PATH;
+                nca_romfs_dir_frame_t *grown = realloc(frames, next_capacity * sizeof(*frames));
+                if (grown == NULL) {
+                    fprintf(stderr, "Failed to grow RomFS traversal stack!\n");
+                    free(frames);
+                    exit(EXIT_FAILURE);
+                }
+                frames = grown;
+                capacity = next_capacity;
+                frame = &frames[frame_count - 1];
+            }
+            nca_romfs_dir_frame_t *child = &frames[frame_count++];
+            memset(child, 0, sizeof(*child));
+            child->next_offset = entry->child;
+            filepath_copy(&child->path, &cur_path);
+            child->has_files = direct_files;
+            child->remove_if_empty = 1;
+        } else {
+            frame->has_files |= direct_files;
+            if (ctx->type == BKTR && (ctx->tool_ctx->action & ACTION_ONLYUPDATEDROMFS) && !direct_files) {
+                os_rmdir(cur_path.os_path);
+            }
+        }
+    }
+
+    free(frames);
+    return result;
+}
+
+static romfs_direntry_t *nca_checked_nca0_direntry(nca_section_ctx_t *ctx, uint32_t offset) {
+    uint64_t table_size = ctx->nca0_romfs_ctx.header.dir_meta_table_size;
+    if (offset == ROMFS_ENTRY_EMPTY || offset > table_size || table_size - offset < sizeof(romfs_direntry_t)) {
+        fprintf(stderr, "Invalid NCA0 RomFS directory entry offset!\n");
+        exit(EXIT_FAILURE);
+    }
+    romfs_direntry_t *entry = romfs_get_direntry(ctx->nca0_romfs_ctx.directories, offset);
+    if (entry->name_size > table_size - offset - sizeof(romfs_direntry_t) || entry->name_size > MAX_PATH) {
+        fprintf(stderr, "Invalid NCA0 RomFS directory name bounds!\n");
+        exit(EXIT_FAILURE);
+    }
+    return entry;
+}
+
+static romfs_fentry_t *nca_checked_nca0_fentry(nca_section_ctx_t *ctx, uint32_t offset) {
+    uint64_t table_size = ctx->nca0_romfs_ctx.header.file_meta_table_size;
+    if (offset == ROMFS_ENTRY_EMPTY || offset > table_size || table_size - offset < sizeof(romfs_fentry_t)) {
+        fprintf(stderr, "Invalid NCA0 RomFS file entry offset!\n");
+        exit(EXIT_FAILURE);
+    }
+    romfs_fentry_t *entry = romfs_get_fentry(ctx->nca0_romfs_ctx.files, offset);
+    if (entry->name_size > table_size - offset - sizeof(romfs_fentry_t) || entry->name_size > MAX_PATH) {
+        fprintf(stderr, "Invalid NCA0 RomFS file name bounds!\n");
+        exit(EXIT_FAILURE);
+    }
+    return entry;
 }
 
 static int nca_visit_nca0_romfs_file(nca_section_ctx_t *ctx, uint32_t file_offset, filepath_t *dir_path) {
@@ -1598,115 +1930,114 @@ static int nca_visit_nca0_romfs_file(nca_section_ctx_t *ctx, uint32_t file_offse
     }
 
     int found_any_file = 0;
+    uint64_t processed = 0;
+    uint64_t table_size = ctx->nca0_romfs_ctx.header.file_meta_table_size;
+    uint64_t max_entries = table_size / sizeof(romfs_fentry_t) + 1;
+    uint64_t region_size = ctx->nca0_romfs_ctx.superblock->romfs_size;
+    uint64_t data_offset = ctx->nca0_romfs_ctx.header.data_offset;
 
-    do {
-        romfs_fentry_t *entry = romfs_get_fentry(ctx->nca0_romfs_ctx.files, file_offset);
-
-        filepath_copy(cur_path, dir_path);
-        if (entry->name_size) {
-            filepath_append_n(cur_path, entry->name_size, "%s", entry->name);
+    while (file_offset != ROMFS_ENTRY_EMPTY) {
+        if (++processed > max_entries) {
+            fprintf(stderr, "Cyclic or invalid NCA0 RomFS file sibling chain!\n");
+            free(cur_path);
+            exit(EXIT_FAILURE);
+        }
+        romfs_fentry_t *entry = nca_checked_nca0_fentry(ctx, file_offset);
+        if (data_offset > region_size || entry->offset > region_size - data_offset || entry->size > region_size - data_offset - entry->offset) {
+            fprintf(stderr, "NCA0 RomFS file data lies outside the RomFS region!\n");
+            free(cur_path);
+            exit(EXIT_FAILURE);
         }
 
-        int found_file = 1;
-
-        /* If we're extracting... */
-        uint64_t phys_offset = ctx->nca0_romfs_ctx.romfs_offset + ctx->nca0_romfs_ctx.header.data_offset + entry->offset;
-
+        filepath_copy(cur_path, dir_path);
+        if (entry->name_size) filepath_append_bytes_n(cur_path, entry->name, entry->name_size);
+        uint64_t phys_offset = ctx->nca0_romfs_ctx.romfs_offset + data_offset + entry->offset;
         if ((ctx->tool_ctx->action & ACTION_LISTROMFS) == 0) {
-            printf("Saving %s...\n", cur_path->char_path);
+            if ((processed % 1024) == 0) printf("Processed %" PRIu64 " NCA0 RomFS files...\n", processed);
             nca_save_section_file(ctx, phys_offset, entry->size, cur_path);
         } else {
             printf("rom:%s\n", cur_path->char_path);
         }
-
-        found_any_file |= found_file;
-
+        found_any_file = 1;
         file_offset = entry->sibling;
-    } while (file_offset != ROMFS_ENTRY_EMPTY);
+    }
 
     free(cur_path);
-
     return found_any_file;
 }
 
-static int nca_visit_romfs_dir(nca_section_ctx_t *ctx, uint32_t dir_offset, filepath_t *parent_path) {
-    romfs_direntry_t *entry;
-    if (ctx->type == ROMFS) {
-        entry = romfs_get_direntry(ctx->romfs_ctx.directories, dir_offset);
-    } else {
-        entry = romfs_get_direntry(ctx->bktr_ctx.directories, dir_offset);
-    }
-    filepath_t *cur_path = calloc(1, sizeof(filepath_t));
-    if (cur_path == NULL) {
-        fprintf(stderr, "Failed to allocate filepath!\n");
-        exit(EXIT_FAILURE);
-    }
-
-    filepath_copy(cur_path, parent_path);
-    if (entry->name_size) {
-        filepath_append_n(cur_path, entry->name_size, "%s", entry->name);
-    }
-
-    /* If we're actually extracting the romfs, make directory. */
-    if ((ctx->tool_ctx->action & ACTION_LISTROMFS) == 0) {
-        os_makedir(cur_path->os_path);
-    }
-
-    int any_files = 0;
-
-    if (entry->file != ROMFS_ENTRY_EMPTY) {
-        any_files |= nca_visit_romfs_file(ctx, entry->file, cur_path);
-    }
-    if (entry->child != ROMFS_ENTRY_EMPTY) {
-        any_files |= nca_visit_romfs_dir(ctx, entry->child, cur_path);
-    }
-
-    if (any_files == 0 && ctx->type == BKTR && (ctx->tool_ctx->action & ACTION_ONLYUPDATEDROMFS)) {
-        os_rmdir(cur_path->os_path);
-    }
-
-
-    if (entry->sibling != ROMFS_ENTRY_EMPTY) {
-        nca_visit_romfs_dir(ctx, entry->sibling, parent_path);
-    }
-
-    free(cur_path);
-    return any_files;
-}
-
 static int nca_visit_nca0_romfs_dir(nca_section_ctx_t *ctx, uint32_t dir_offset, filepath_t *parent_path) {
-    romfs_direntry_t *entry = romfs_get_direntry(ctx->nca0_romfs_ctx.directories, dir_offset);
-    filepath_t *cur_path = calloc(1, sizeof(filepath_t));
-    if (cur_path == NULL) {
-        fprintf(stderr, "Failed to allocate filepath!\n");
+    size_t capacity = 16;
+    size_t frame_count = 1;
+    uint64_t visited = 0;
+    uint64_t table_size = ctx->nca0_romfs_ctx.header.dir_meta_table_size;
+    uint64_t max_entries = table_size / sizeof(romfs_direntry_t) + 1;
+    nca_romfs_dir_frame_t *frames = calloc(capacity, sizeof(*frames));
+    if (frames == NULL) {
+        fprintf(stderr, "Failed to allocate NCA0 RomFS traversal stack!\n");
         exit(EXIT_FAILURE);
     }
+    frames[0].next_offset = dir_offset;
+    filepath_copy(&frames[0].path, parent_path);
 
-    filepath_copy(cur_path, parent_path);
-    if (entry->name_size) {
-        filepath_append_n(cur_path, entry->name_size, "%s", entry->name);
+    int result = 0;
+    while (frame_count > 0) {
+        nca_romfs_dir_frame_t *frame = &frames[frame_count - 1];
+        if (frame->next_offset == ROMFS_ENTRY_EMPTY) {
+            int subtree_has_files = frame->has_files;
+            frame_count--;
+            if (frame_count > 0) frames[frame_count - 1].has_files |= subtree_has_files;
+            else result = subtree_has_files;
+            continue;
+        }
+
+        uint32_t current_offset = frame->next_offset;
+        romfs_direntry_t *entry = nca_checked_nca0_direntry(ctx, current_offset);
+        frame->next_offset = entry->sibling;
+        if (++visited > max_entries) {
+            fprintf(stderr, "Cyclic or invalid NCA0 RomFS directory graph!\n");
+            free(frames);
+            exit(EXIT_FAILURE);
+        }
+
+        filepath_t cur_path;
+        filepath_copy(&cur_path, &frame->path);
+        if (entry->name_size) filepath_append_bytes_n(&cur_path, entry->name, entry->name_size);
+        if ((ctx->tool_ctx->action & ACTION_LISTROMFS) == 0) os_makedir(cur_path.os_path);
+        int direct_files = 0;
+        if (entry->file != ROMFS_ENTRY_EMPTY) direct_files = nca_visit_nca0_romfs_file(ctx, entry->file, &cur_path);
+
+        if (entry->child != ROMFS_ENTRY_EMPTY) {
+            if (frame_count >= MAX_PATH) {
+                fprintf(stderr, "NCA0 RomFS directory nesting exceeds the supported path depth!\n");
+                free(frames);
+                exit(EXIT_FAILURE);
+            }
+            if (frame_count == capacity) {
+                size_t next_capacity = capacity * 2;
+                if (next_capacity > MAX_PATH) next_capacity = MAX_PATH;
+                nca_romfs_dir_frame_t *grown = realloc(frames, next_capacity * sizeof(*frames));
+                if (grown == NULL) {
+                    fprintf(stderr, "Failed to grow NCA0 RomFS traversal stack!\n");
+                    free(frames);
+                    exit(EXIT_FAILURE);
+                }
+                frames = grown;
+                capacity = next_capacity;
+                frame = &frames[frame_count - 1];
+            }
+            nca_romfs_dir_frame_t *child = &frames[frame_count++];
+            memset(child, 0, sizeof(*child));
+            child->next_offset = entry->child;
+            filepath_copy(&child->path, &cur_path);
+            child->has_files = direct_files;
+        } else {
+            frame->has_files |= direct_files;
+        }
     }
 
-    /* If we're actually extracting the romfs, make directory. */
-    if ((ctx->tool_ctx->action & ACTION_LISTROMFS) == 0) {
-        os_makedir(cur_path->os_path);
-    }
-
-    int any_files = 0;
-
-    if (entry->file != ROMFS_ENTRY_EMPTY) {
-        any_files |= nca_visit_nca0_romfs_file(ctx, entry->file, cur_path);
-    }
-    if (entry->child != ROMFS_ENTRY_EMPTY) {
-        any_files |= nca_visit_nca0_romfs_dir(ctx, entry->child, cur_path);
-    }
-
-    if (entry->sibling != ROMFS_ENTRY_EMPTY) {
-        any_files |= nca_visit_nca0_romfs_dir(ctx, entry->sibling, parent_path);
-    }
-
-    free(cur_path);
-    return any_files;
+    free(frames);
+    return result;
 }
 
 void nca_save_ivfc_section(nca_section_ctx_t *ctx) {

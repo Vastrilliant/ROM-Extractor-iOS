@@ -43,6 +43,10 @@ typedef struct {
     nca0_romfs_hdr_t header;
     romfs_direntry_t *directories;
     romfs_fentry_t *files;
+    FILE *directories_backing;
+    FILE *files_backing;
+    size_t directories_size;
+    size_t files_size;
 } nca0_romfs_ctx_t;
 
 void nca0_romfs_process(nca0_romfs_ctx_t *ctx);

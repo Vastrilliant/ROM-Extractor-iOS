@@ -12,17 +12,19 @@ static void romfs_visit_file(romfs_ctx_t *ctx, uint32_t file_offset, filepath_t 
         exit(EXIT_FAILURE);
     }
 
+    uint64_t processed = 0;
     while (file_offset != ROMFS_ENTRY_EMPTY) {
         romfs_fentry_t *entry = romfs_get_fentry(ctx->files, file_offset);
+        processed++;
 
         filepath_copy(cur_path, dir_path);
         if (entry->name_size) {
-            filepath_append_n(cur_path, entry->name_size, "%s", entry->name);
+            filepath_append_bytes_n(cur_path, entry->name, entry->name_size);
         }
 
         /* If we're extracting... */
         if ((ctx->tool_ctx->action & ACTION_LISTROMFS) == 0) {
-            printf("Saving %s...\n", cur_path->char_path);
+            if ((processed % 1024) == 0) printf("Processed %" PRIu64 " RomFS files...\n", processed);
             save_file_section(ctx->file, ctx->romfs_offset + ctx->header.data_offset + entry->offset, entry->size, cur_path);
         } else {
             printf("rom:%s\n", cur_path->char_path);
@@ -44,7 +46,7 @@ static void romfs_visit_dir(romfs_ctx_t *ctx, uint32_t dir_offset, filepath_t *p
 
     filepath_copy(cur_path, parent_path);
     if (entry->name_size) {
-        filepath_append_n(cur_path, entry->name_size, "%s", entry->name);
+        filepath_append_bytes_n(cur_path, entry->name, entry->name_size);
     }
 
     /* If we're actually extracting the romfs, make directory. */

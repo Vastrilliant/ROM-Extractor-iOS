@@ -5,6 +5,10 @@
 #include <fcntl.h>
 #include <getopt.h>
 #include <pthread.h>
+#include <stdint.h>
+#ifdef __APPLE__
+#include <mach/mach.h>
+#endif
 #include "hactool_runner.h"
 
 int hactool_main(int argc, char **argv);
@@ -62,4 +66,15 @@ int hactool_run(int argc, char **argv, const char *home, const char *log_path) {
 
     pthread_mutex_unlock(&g_lock);
     return ret;
+}
+
+uint64_t hactool_process_resident_memory(void) {
+#ifdef __APPLE__
+    mach_task_basic_info_data_t info;
+    mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
+    kern_return_t result = task_info(mach_task_self(), MACH_TASK_BASIC_INFO, (task_info_t)&info, &count);
+    return result == KERN_SUCCESS ? (uint64_t)info.resident_size : 0;
+#else
+    return 0;
+#endif
 }

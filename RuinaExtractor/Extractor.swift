@@ -118,7 +118,7 @@ final class Extractor: ObservableObject {
                     "--exefsdir=\(exefsDir.path)", "--romfsdir=\(romfsDir.path)"]
         if let basePath { args.append("--basenca=\(basePath)") }
         args.append(targetProgram.url.path)
-        let r = await HactoolRunner.run(args, home: home, logURL: logURL)
+        let r = await runHactool(args, stage: "Extracting Program NCA", home: home, logURL: logURL)
         append(trimmed(r.log))
         guard r.code == 0 else { throw ExtractionError("hactool failed while extracting the Program NCA (exit \(r.code)). See log.") }
 
@@ -130,9 +130,9 @@ final class Extractor: ObservableObject {
         // 6. Decompress main (NSO) for IL2CPP tooling
         status = "Decompressing main…"
         let uncompressed = work.appendingPathComponent("main.uncompressed")
-        let r2 = await HactoolRunner.run(["-k", keysCopy.path, "--disablekeywarns", "-t", "nso0",
-                                          "--uncompressed=\(uncompressed.path)", mainFile.path],
-                                         home: home, logURL: logURL)
+        let r2 = await runHactool(["-k", keysCopy.path, "--disablekeywarns", "-t", "nso0",
+                                   "--uncompressed=\(uncompressed.path)", mainFile.path],
+                                  stage: "Decompressing main NSO", home: home, logURL: logURL)
         if r2.code != 0 || !fm.fileExists(atPath: uncompressed.path) {
             append("[WARN] Could not produce an uncompressed main.\n")
         }
@@ -169,6 +169,51 @@ final class Extractor: ObservableObject {
         status = "Done. Files are in Files › On My iPhone › RuinaExtractor › Extracted."
     }
 
+    private func runHactool(_ args: [String], stage: String, home: URL, logURL: URL) async -> HactoolRunner.Result {
+        recordDiagnostic(stage, event: "start")
+        let monitor = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 2_000_000_000)
+                guard !Task.isCancelled, let self else { break }
+                self.recordDiagnostic(stage, event: "heartbeat")
+            }
+        }
+        let result = await HactoolRunner.run(args, home: home, logURL: logURL)
+        monitor.cancel()
+        recordDiagnostic(stage, event: "end exit=\(result.code)")
+        return result
+    }
+
+    private func recordDiagnostic(_ stage: String, event: String) {
+        let documents = fm.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        let url = documents.appendingPathComponent("RuinaExtractor-diagnostics.log")
+        let rss = hactool_process_resident_memory()
+        let line = "\(Date().timeIntervalSince1970) stage=\(stage) event=\(event) resident_bytes=\(rss)\n"
+        let limit = 256 * 1024
+
+        if let attributes = try? fm.attributesOfItem(atPath: url.path),
+           let size = attributes[.size] as? NSNumber,
+           size.intValue > limit,
+           let reader = try? FileHandle(forReadingFrom: url) {
+            let end = (try? reader.seekToEnd()) ?? 0
+            let start = end > 128 * 1024 ? end - 128 * 1024 : 0
+            try? reader.seek(toOffset: start)
+            let tail = (try? reader.read(upToCount: Int(end - start))) ?? Data()
+            try? reader.close()
+            try? tail.write(to: url, options: .atomic)
+        }
+
+        if !fm.fileExists(atPath: url.path) {
+            try? Data().write(to: url, options: .atomic)
+        }
+        if let handle = try? FileHandle(forWritingTo: url) {
+            defer { try? handle.close() }
+            try? handle.seekToEnd()
+            try? handle.write(contentsOf: Data(line.utf8))
+            try? handle.synchronize()
+        }
+    }
+
     // MARK: - Steps
 
     private func unpackContainer(_ url: URL, into dir: URL, keys: URL, home: URL, logURL: URL) async throws {
@@ -180,7 +225,7 @@ final class Extractor: ObservableObject {
         case .nsp:
             args = ["-k", keys.path, "--disablekeywarns", "-t", "pfs0", "--pfs0dir=\(dir.path)", url.path]
         }
-        let r = await HactoolRunner.run(args, home: home, logURL: logURL)
+        let r = await runHactool(args, stage: "Unpacking \(url.lastPathComponent)", home: home, logURL: logURL)
         append(trimmed(r.log))
         guard r.code == 0 else { throw ExtractionError("hactool failed to unpack \(url.lastPathComponent) (exit \(r.code)).") }
         guard !files(in: dir, ext: "nca").isEmpty else {
@@ -210,8 +255,8 @@ final class Extractor: ObservableObject {
             .sorted { size($0) > size($1) }
             .prefix(8)
         for nca in candidates {
-            let r = await HactoolRunner.run(["-k", keys.path, "--disablekeywarns", "-t", "nca", nca.path],
-                                            home: home, logURL: logURL)
+            let r = await runHactool(["-k", keys.path, "--disablekeywarns", "-t", "nca", nca.path],
+                                     stage: "Inspecting \(nca.lastPathComponent)", home: home, logURL: logURL)
             var type: String?, tid: String?
             for line in r.log.split(separator: "\n") {
                 if line.hasPrefix("Content Type:") { type = line.dropFirst("Content Type:".count).trimmingCharacters(in: .whitespaces) }
