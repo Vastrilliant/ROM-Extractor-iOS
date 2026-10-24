@@ -401,7 +401,7 @@ static void nca_compression_init(nca_section_ctx_t *ctx, uint64_t base_offset, u
         uint64_t end = i + 1 < entry_count ? c->entries[i + 1].virtual_offset : virtual_size;
         if (end <= entry->virtual_offset || end > virtual_size) {
             error = "entries are not strictly increasing";
-        } else if (end - entry->virtual_offset > NCA_COMPRESSION_MAX_ENTRY_SIZE) {
+        } else if (entry->type > NCA_COMPRESSION_TYPE_ZEROS && end - entry->virtual_offset > NCA_COMPRESSION_MAX_ENTRY_SIZE) {
             error = "entry is larger than the supported block size";
         } else if (entry->type != NCA_COMPRESSION_TYPE_ZEROS) {
             uint64_t stored = entry->type == NCA_COMPRESSION_TYPE_NONE ? end - entry->virtual_offset : entry->physical_size;
@@ -443,6 +443,7 @@ static int nca_compression_load_entry(nca_section_ctx_t *ctx, size_t index) {
     size_t virtual_size = (size_t)(end - entry->virtual_offset);
 
     c->cache_valid = 0;
+    if (entry->type <= NCA_COMPRESSION_TYPE_ZEROS) return 0;
     if (virtual_size > c->cache_capacity) {
         unsigned char *grown = realloc(c->cache, virtual_size);
         if (grown == NULL) {
@@ -453,15 +454,7 @@ static int nca_compression_load_entry(nca_section_ctx_t *ctx, size_t index) {
         c->cache_capacity = virtual_size;
     }
 
-    if (entry->type == NCA_COMPRESSION_TYPE_ZEROS) {
-        memset(c->cache, 0, virtual_size);
-    } else if (entry->type == NCA_COMPRESSION_TYPE_NONE) {
-        nca_section_raw_fseek(ctx, c->base_offset + entry->physical_offset);
-        if (nca_section_raw_fread(ctx, c->cache, virtual_size) != virtual_size) {
-            fprintf(stderr, "Failed to read uncompressed block at section offset 0x%"PRIx64"!\n", entry->physical_offset);
-            return 0;
-        }
-    } else {
+    {
         size_t physical_size = entry->physical_size;
         if (physical_size == 0 || physical_size > INT_MAX || virtual_size > INT_MAX) {
             fprintf(stderr, "Invalid LZ4 block sizes at section offset 0x%"PRIx64"!\n", entry->physical_offset);
@@ -500,6 +493,29 @@ static size_t nca_compression_fread(nca_section_ctx_t *ctx, void *buffer, size_t
     size_t done = 0;
     while (done < count && c->seek < c->virtual_size) {
         size_t index;
+        if (!(c->cache_valid && c->seek >= c->entries[c->cache_index].virtual_offset &&
+            c->seek - c->entries[c->cache_index].virtual_offset < c->cache_size)) {
+            index = nca_compression_find_entry(c, c->seek);
+            const nca_compression_entry_t *entry = &c->entries[index];
+            if (entry->type <= NCA_COMPRESSION_TYPE_ZEROS) {
+                uint64_t end = index + 1 < c->entry_count ? c->entries[index + 1].virtual_offset : c->virtual_size;
+                uint64_t within = c->seek - entry->virtual_offset;
+                uint64_t left = end - c->seek;
+                size_t chunk = left < count - done ? (size_t)left : count - done;
+                if (entry->type == NCA_COMPRESSION_TYPE_ZEROS) {
+                    memset(out + done, 0, chunk);
+                } else {
+                    nca_section_raw_fseek(ctx, c->base_offset + entry->physical_offset + within);
+                    if (nca_section_raw_fread(ctx, out + done, chunk) != chunk) {
+                        fprintf(stderr, "Failed to read uncompressed block at section offset 0x%"PRIx64"!\n", c->base_offset + entry->physical_offset + within);
+                        break;
+                    }
+                }
+                done += chunk;
+                c->seek += chunk;
+                continue;
+            }
+        }
         if (c->cache_valid && c->seek >= c->entries[c->cache_index].virtual_offset &&
             c->seek - c->entries[c->cache_index].virtual_offset < c->cache_size) {
             index = c->cache_index;
