@@ -150,6 +150,30 @@ enum nca_content_type {
 };
 
 typedef struct {
+    uint64_t virtual_offset;
+    uint64_t physical_offset;
+    uint32_t physical_size;
+    uint8_t type;
+} nca_compression_entry_t;
+
+typedef struct {
+    int active;
+    uint64_t table_offset;
+    uint64_t table_size;
+    uint32_t entry_count;
+    uint64_t virtual_size;
+    nca_compression_entry_t *entries;
+    uint64_t seek;
+    int cache_valid;
+    size_t cache_index;
+    size_t cache_size;
+    size_t cache_capacity;
+    unsigned char *cache;
+    size_t scratch_capacity;
+    unsigned char *scratch;
+} nca_compression_ctx_t;
+
+typedef struct {
     int is_present;
     enum nca_section_type type;
     FILE *file; /* Pointer to file. */
@@ -175,6 +199,7 @@ typedef struct {
     uint32_t sector_ofs;
     int physical_reads; /* Should reads be forced physical? */
     section_crypt_type_t crypt_type;
+    nca_compression_ctx_t compression;
 } nca_section_ctx_t;
 
 typedef struct nca_ctx {
