@@ -158,6 +158,7 @@ typedef struct {
 
 typedef struct {
     int active;
+    uint64_t base_offset;
     uint64_t table_offset;
     uint64_t table_size;
     uint32_t entry_count;

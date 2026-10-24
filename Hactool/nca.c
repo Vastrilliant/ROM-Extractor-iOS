@@ -304,7 +304,7 @@ static int nca_section_has_compression(const nca_section_ctx_t *ctx) {
 }
 
 static uint64_t nca_section_virtual_size(const nca_section_ctx_t *ctx) {
-    return ctx->compression.active ? ctx->compression.virtual_size : ctx->size;
+    return ctx->compression.active ? ctx->compression.base_offset + ctx->compression.virtual_size : ctx->size;
 }
 
 static void nca_compression_free(nca_section_ctx_t *ctx) {
@@ -325,7 +325,7 @@ static void nca_compression_hex(const char *label, const unsigned char *p, size_
     fprintf(stderr, "\n");
 }
 
-static void nca_compression_init(nca_section_ctx_t *ctx) {
+static void nca_compression_init(nca_section_ctx_t *ctx, uint64_t base_offset, uint64_t region_size) {
     nca_compression_ctx_t *c = &ctx->compression;
     const unsigned char *info = ctx->header->_0x148 + NCA_COMPRESSION_INFO_OFFSET;
     uint64_t table_offset = nca_le64(info);
@@ -340,7 +340,8 @@ static void nca_compression_init(nca_section_ctx_t *ctx) {
     uint64_t entry_storage = entry_sets * NCA_COMPRESSION_NODE_SIZE;
     uint64_t needed = node_storage + entry_storage;
 
-    if (table_offset > ctx->size || table_size > ctx->size - table_offset) nca_compression_fail(ctx, "table lies outside the section");
+    if (base_offset > ctx->size || region_size > ctx->size - base_offset) nca_compression_fail(ctx, "data region lies outside the section");
+    if (table_offset > region_size || table_size > region_size - table_offset) nca_compression_fail(ctx, "table lies outside the data region");
     if (needed > table_size || needed > NCA_COMPRESSION_MAX_TABLE_SIZE) nca_compression_fail(ctx, "table size does not match entry count");
 
     unsigned char *table = malloc((size_t)needed);
@@ -352,7 +353,7 @@ static void nca_compression_init(nca_section_ctx_t *ctx) {
         exit(EXIT_FAILURE);
     }
 
-    nca_section_raw_fseek(ctx, table_offset);
+    nca_section_raw_fseek(ctx, base_offset + table_offset);
     if (nca_section_raw_fread(ctx, table, (size_t)needed) != (size_t)needed) {
         free(table);
         nca_compression_free(ctx);
@@ -417,6 +418,7 @@ static void nca_compression_init(nca_section_ctx_t *ctx) {
         nca_compression_fail(ctx, error);
     }
 
+    c->base_offset = base_offset;
     c->table_offset = table_offset;
     c->table_size = table_size;
     c->entry_count = entry_count;
@@ -454,7 +456,7 @@ static int nca_compression_load_entry(nca_section_ctx_t *ctx, size_t index) {
     if (entry->type == NCA_COMPRESSION_TYPE_ZEROS) {
         memset(c->cache, 0, virtual_size);
     } else if (entry->type == NCA_COMPRESSION_TYPE_NONE) {
-        nca_section_raw_fseek(ctx, entry->physical_offset);
+        nca_section_raw_fseek(ctx, c->base_offset + entry->physical_offset);
         if (nca_section_raw_fread(ctx, c->cache, virtual_size) != virtual_size) {
             fprintf(stderr, "Failed to read uncompressed block at section offset 0x%"PRIx64"!\n", entry->physical_offset);
             return 0;
@@ -474,7 +476,7 @@ static int nca_compression_load_entry(nca_section_ctx_t *ctx, size_t index) {
             c->scratch = grown;
             c->scratch_capacity = physical_size;
         }
-        nca_section_raw_fseek(ctx, entry->physical_offset);
+        nca_section_raw_fseek(ctx, c->base_offset + entry->physical_offset);
         if (nca_section_raw_fread(ctx, c->scratch, physical_size) != physical_size) {
             fprintf(stderr, "Failed to read compressed block at section offset 0x%"PRIx64"!\n", entry->physical_offset);
             return 0;
@@ -524,10 +526,24 @@ void nca_section_fseek(nca_section_ctx_t *ctx, uint64_t offset) {
 }
 
 size_t nca_section_fread(nca_section_ctx_t *ctx, void *buffer, size_t count) {
-    if (ctx->compression.active && !ctx->physical_reads) {
-        return nca_compression_fread(ctx, buffer, count);
+    nca_compression_ctx_t *c = &ctx->compression;
+    if (!c->active || ctx->physical_reads) {
+        return nca_section_raw_fread(ctx, buffer, count);
     }
-    return nca_section_raw_fread(ctx, buffer, count);
+    if (c->seek < c->base_offset) {
+        size_t chunk = count;
+        if (chunk > c->base_offset - c->seek) chunk = (size_t)(c->base_offset - c->seek);
+        nca_section_raw_fseek(ctx, c->seek);
+        size_t got = nca_section_raw_fread(ctx, buffer, chunk);
+        c->seek += got;
+        if (got != chunk || chunk == count) return got;
+        return got + nca_section_fread(ctx, (unsigned char *)buffer + got, count - got);
+    }
+    uint64_t saved = c->seek;
+    c->seek -= c->base_offset;
+    size_t got = nca_compression_fread(ctx, buffer, count);
+    c->seek = saved + got;
+    return got;
 }
 
 static void *nca_allocate_file_backed_table(uint64_t requested_size, FILE **backing_file) {
@@ -861,12 +877,8 @@ void nca_process(nca_ctx_t *ctx) {
                 }
             }
 
-            if (nca_section_has_compression(&ctx->section_contexts[i])) {
-                if (ctx->section_contexts[i].type == ROMFS || ctx->section_contexts[i].type == PFS0) {
-                    nca_compression_init(&ctx->section_contexts[i]);
-                } else {
-                    fprintf(stderr, "[WARN] Section %"PRId32" has a compression layer that is not supported for this section type.\n", i);
-                }
+            if (nca_section_has_compression(&ctx->section_contexts[i]) && ctx->section_contexts[i].type != ROMFS) {
+                fprintf(stderr, "[WARN] Section %"PRId32" has a compression layer that is not supported for this section type.\n", i);
             }
 
             if (ctx->tool_ctx->action & ACTION_VERIFY) {
@@ -1294,7 +1306,7 @@ static void nca_save_pfs0_file(nca_section_ctx_t *ctx, uint32_t i, filepath_t *d
         exit(EXIT_FAILURE);
     }
     pfs0_file_entry_t *cur_file = pfs0_get_file_entry(ctx->pfs0_ctx.header, i);
-    if (cur_file->size >= nca_section_virtual_size(ctx)) {
+    if (cur_file->size >= ctx->size) {
         fprintf(stderr, "File %"PRId32" too big in PFS0 (section %"PRId32")!\n", i, ctx->section_num);
         exit(EXIT_FAILURE);
     }
@@ -1468,9 +1480,13 @@ void nca_process_ivfc_section(nca_section_ctx_t *ctx) {
 
     ctx->romfs_ctx.romfs_offset = ctx->romfs_ctx.ivfc_levels[IVFC_MAX_LEVEL - 1].data_offset;
     if (!nca_romfs_span_valid(ctx->romfs_ctx.romfs_offset,
-        ctx->romfs_ctx.ivfc_levels[IVFC_MAX_LEVEL - 1].data_size, nca_section_virtual_size(ctx))) {
+        ctx->romfs_ctx.ivfc_levels[IVFC_MAX_LEVEL - 1].data_size, ctx->size)) {
         fprintf(stderr, "Invalid NCA RomFS section bounds!\n");
         exit(EXIT_FAILURE);
+    }
+    if (nca_section_has_compression(ctx)) {
+        nca_compression_init(ctx, ctx->romfs_ctx.romfs_offset, ctx->romfs_ctx.ivfc_levels[IVFC_MAX_LEVEL - 1].data_size);
+        ctx->romfs_ctx.ivfc_levels[IVFC_MAX_LEVEL - 1].data_size = ctx->compression.virtual_size;
     }
     nca_section_fseek(ctx, ctx->romfs_ctx.romfs_offset);
     if (nca_section_fread(ctx, &ctx->romfs_ctx.header, sizeof(romfs_hdr_t)) != sizeof(romfs_hdr_t)) {
