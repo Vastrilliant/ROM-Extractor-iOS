@@ -1225,6 +1225,12 @@ void nca_process_ivfc_section(nca_section_ctx_t *ctx) {
         unsigned sparse_generation = (unsigned)sp[0x28] | ((unsigned)sp[0x29] << 8);
         printf("RomFS section: offset=0x%"PRIx64" size=0x%"PRIx64" romfs_offset=0x%"PRIx64" sparse_generation=%u sparse_magic=0x%08x sparse_meta=0x%"PRIx64"+0x%"PRIx64"\n",
             ctx->offset, ctx->size, ctx->romfs_ctx.romfs_offset, sparse_generation, sparse_magic, sparse_meta_offset, sparse_meta_size);
+        {
+            const uint8_t *raw = (const uint8_t *)ctx->header;
+            printf("FS header:");
+            for (size_t b = 0; b < sizeof(nca_fs_header_t); b++) printf("%s%02x", (b % 16 == 0) ? " " : "", raw[b]);
+            printf("\n");
+        }
     }
 
     if ((ctx->tool_ctx->action & (ACTION_EXTRACT | ACTION_LISTROMFS)) && ctx->romfs_ctx.header.header_size == ROMFS_HEADER_SIZE) {
