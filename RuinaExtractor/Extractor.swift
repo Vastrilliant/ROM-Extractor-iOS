@@ -499,7 +499,8 @@ final class Extractor: ObservableObject {
         let candidates = files(in: dir, ext: "nca")
             .filter { !$0.lastPathComponent.hasSuffix(".cnmt.nca") }
             .sorted { size($0) > size($1) }
-            .prefix(8)
+        append("Found \(candidates.count) NCA file(s) in \(dir.lastPathComponent)")
+        var shownFailures = 0
         for nca in candidates {
             let r = await runHactool(["-k", keys.path, "--disablekeywarns", "-t", "nca", nca.path],
                                      stage: "Inspecting \(nca.lastPathComponent)", home: home, logURL: logURL, echo: false)
@@ -509,6 +510,11 @@ final class Extractor: ObservableObject {
                 if line.hasPrefix("Title ID:") { tid = line.dropFirst("Title ID:".count).trimmingCharacters(in: .whitespaces) }
             }
             append("  \(nca.lastPathComponent): \(type ?? "unknown type"), \(ConsoleLog.bytes(Int64(size(nca))))")
+            if type == nil, shownFailures < 3 {
+                shownFailures += 1
+                let tail = r.log.split(separator: "\n").suffix(12).joined(separator: "\n")
+                append("  hactool exit=\(r.code), output:\n\(tail.isEmpty ? "(empty)" : tail)")
+            }
             if type == "Program", let tid { return ProgramNCA(url: nca, titleID: tid) }
         }
         return nil
