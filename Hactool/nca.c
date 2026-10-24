@@ -1214,6 +1214,19 @@ void nca_process_ivfc_section(nca_section_ctx_t *ctx) {
         exit(EXIT_FAILURE);
     }
 
+    if (ctx->tool_ctx->action & (ACTION_EXTRACT | ACTION_LISTROMFS)) {
+        const uint8_t *sp = ctx->header->_0x148;
+        uint32_t sparse_magic = (uint32_t)sp[0x10] | ((uint32_t)sp[0x11] << 8) | ((uint32_t)sp[0x12] << 16) | ((uint32_t)sp[0x13] << 24);
+        uint64_t sparse_meta_offset = 0, sparse_meta_size = 0;
+        for (int b = 7; b >= 0; b--) {
+            sparse_meta_offset = (sparse_meta_offset << 8) | sp[b];
+            sparse_meta_size = (sparse_meta_size << 8) | sp[8 + b];
+        }
+        unsigned sparse_generation = (unsigned)sp[0x28] | ((unsigned)sp[0x29] << 8);
+        printf("RomFS section: offset=0x%"PRIx64" size=0x%"PRIx64" romfs_offset=0x%"PRIx64" sparse_generation=%u sparse_magic=0x%08x sparse_meta=0x%"PRIx64"+0x%"PRIx64"\n",
+            ctx->offset, ctx->size, ctx->romfs_ctx.romfs_offset, sparse_generation, sparse_magic, sparse_meta_offset, sparse_meta_size);
+    }
+
     if ((ctx->tool_ctx->action & (ACTION_EXTRACT | ACTION_LISTROMFS)) && ctx->romfs_ctx.header.header_size == ROMFS_HEADER_SIZE) {
         uint64_t region_size = ctx->romfs_ctx.ivfc_levels[IVFC_MAX_LEVEL - 1].data_size;
         nca_validate_romfs_layout(&ctx->romfs_ctx.header, region_size, "NCA");
