@@ -49,3 +49,40 @@ enum HactoolRunner {
         }
     }
 }
+
+/// Follows a log file that another thread is appending to and returns only complete new lines.
+final class LogTailer {
+    private let url: URL
+    private var offset: UInt64 = 0
+    private var partial = ""
+
+    init(url: URL) { self.url = url }
+
+    func readNew() -> String {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return "" }
+        defer { try? handle.close() }
+        guard let end = try? handle.seekToEnd() else { return "" }
+        if end < offset { offset = 0; partial = "" }
+        if end == offset { return "" }
+        let take = min(end - offset, 256 * 1024)
+        do {
+            try handle.seek(toOffset: offset)
+            let data = try handle.read(upToCount: Int(take)) ?? Data()
+            offset += UInt64(data.count)
+            partial += String(decoding: data, as: UTF8.self)
+        } catch {
+            return ""
+        }
+        guard let newline = partial.lastIndex(of: "\n") else { return "" }
+        let complete = String(partial[..<newline])
+        partial = String(partial[partial.index(after: newline)...])
+        return complete
+    }
+
+    func flush() -> String {
+        let rest = readNew()
+        let tail = partial
+        partial = ""
+        return tail.isEmpty ? rest : rest + "\n" + tail
+    }
+}

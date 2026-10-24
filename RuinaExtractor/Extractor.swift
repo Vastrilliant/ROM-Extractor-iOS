@@ -1,4 +1,6 @@
 import Foundation
+import UIKit
+import MetricKit
 
 struct ExtractionError: LocalizedError {
     let message: String
@@ -6,15 +8,267 @@ struct ExtractionError: LocalizedError {
     var errorDescription: String? { message }
 }
 
+struct ConsoleLine: Identifiable {
+    let id: Int
+    let text: String
+}
+
+final class MetricsListener: NSObject, MXMetricManagerSubscriber {
+    func didReceive(_ payloads: [MXMetricPayload]) {
+        var summaries: [String] = []
+        for payload in payloads {
+            guard let exits = payload.applicationExitMetrics else { continue }
+            let fg = exits.foregroundExitData
+            let bg = exits.backgroundExitData
+            summaries.append("[MetricKit] exits fg: normal=\(fg.cumulativeNormalAppExitCount) memoryLimit=\(fg.cumulativeMemoryResourceLimitExitCount) badAccess=\(fg.cumulativeBadAccessExitCount) abnormal=\(fg.cumulativeAbnormalExitCount) illegal=\(fg.cumulativeIllegalInstructionExitCount) watchdog=\(fg.cumulativeAppWatchdogExitCount) | bg: normal=\(bg.cumulativeNormalAppExitCount) memoryLimit=\(bg.cumulativeMemoryResourceLimitExitCount) memoryPressure=\(bg.cumulativeMemoryPressureExitCount) badAccess=\(bg.cumulativeBadAccessExitCount) abnormal=\(bg.cumulativeAbnormalExitCount) watchdog=\(bg.cumulativeAppWatchdogExitCount)")
+        }
+        post(summaries)
+    }
+
+    func didReceive(_ payloads: [MXDiagnosticPayload]) {
+        var summaries: [String] = []
+        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        for payload in payloads {
+            for crash in payload.crashDiagnostics ?? [] {
+                let type = crash.exceptionType?.stringValue ?? "?"
+                let signal = crash.signal?.stringValue ?? "?"
+                let reason = crash.terminationReason ?? "none"
+                summaries.append("[MetricKit] crash report: exception_type=\(type) signal=\(signal) termination_reason=\(reason)")
+            }
+            let name = "RuinaExtractor-metrickit-\(Int(Date().timeIntervalSince1970)).json"
+            try? payload.jsonRepresentation().write(to: docs.appendingPathComponent(name))
+            summaries.append("[MetricKit] full diagnostic payload saved to Documents/\(name)")
+        }
+        post(summaries)
+    }
+
+    private func post(_ lines: [String]) {
+        guard !lines.isEmpty else { return }
+        Task { @MainActor in
+            for line in lines { ConsoleLog.shared.log(line) }
+        }
+    }
+}
+
+/// Persistent console: everything is appended to Documents/RuinaExtractor-console.log as it happens,
+/// so it survives the app being killed. A marker file detects runs that never finished.
+@MainActor
+final class ConsoleLog: ObservableObject {
+    static let shared = ConsoleLog()
+
+    @Published private(set) var lines: [ConsoleLine] = []
+    @Published var interruptedSummary: String?
+
+    let fileURL: URL
+    private let markerURL: URL
+    private let stampFormatter = DateFormatter()
+    private let uiLimit = 600
+    private let metrics = MetricsListener()
+    private var observers: [NSObjectProtocol] = []
+    private var fd: Int32 = -1
+    private var nextID = 0
+    private var stage = "idle"
+    private var sessionInfo = ""
+    private var sessionActive = false
+
+    private init() {
+        let fm = FileManager.default
+        let docs = fm.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        let support = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        try? fm.createDirectory(at: support, withIntermediateDirectories: true)
+        fileURL = docs.appendingPathComponent("RuinaExtractor-console.log")
+        markerURL = support.appendingPathComponent("run-in-progress.marker")
+        stampFormatter.locale = Locale(identifier: "en_US_POSIX")
+        stampFormatter.dateFormat = "HH:mm:ss.SSS"
+
+        trimFileIfNeeded()
+        let wasInterrupted = fm.fileExists(atPath: markerURL.path)
+        if wasInterrupted { loadTail() }
+        fd = open(fileURL.path, O_WRONLY | O_CREAT | O_APPEND, 0o644)
+        hactool_install_crash_handler(fileURL.path)
+
+        if wasInterrupted {
+            let marker = (try? String(contentsOf: markerURL, encoding: .utf8)) ?? ""
+            let parts = marker.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+            let lastStage = parts.first ?? "unknown"
+            let info = parts.count > 1 ? parts[1] : ""
+            try? fm.removeItem(at: markerURL)
+            log("---- previous run ended unexpectedly during: \(lastStage) \(info) ----")
+            interruptedSummary = "The last run never finished: the app was killed or crashed during \u{201C}\(lastStage)\u{201D}. A [CRASH] block in the console means a real crash (with a backtrace). If there is none, look at the last \u{2665} lines: avail near 0 MB means iOS killed the app for memory, and a background warning means it was suspended."
+        }
+
+        log("=== launched: iOS \(UIDevice.current.systemVersion), \(UIDevice.current.model), RAM \(Self.bytes(Int64(ProcessInfo.processInfo.physicalMemory))) | \(memorySnapshot())")
+        observeSystemEvents()
+        MXMetricManager.shared.add(metrics)
+    }
+
+    static func bytes(_ count: Int64) -> String {
+        count < 0 ? "?" : ByteCountFormatter.string(fromByteCount: count, countStyle: .file)
+    }
+
+    func freeDiskBytes() -> Int64 {
+        let values = try? URL(fileURLWithPath: NSHomeDirectory()).resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
+        return values?.volumeAvailableCapacityForImportantUsage ?? -1
+    }
+
+    func memorySnapshot() -> String {
+        let footprint = Int64(hactool_process_footprint())
+        let avail = Int64(hactool_available_memory())
+        let thermal: String
+        switch ProcessInfo.processInfo.thermalState {
+        case .nominal: thermal = "nominal"
+        case .fair: thermal = "fair"
+        case .serious: thermal = "SERIOUS"
+        case .critical: thermal = "CRITICAL"
+        @unknown default: thermal = "?"
+        }
+        return "footprint=\(Self.bytes(footprint)) avail=\(Self.bytes(avail)) disk_free=\(Self.bytes(freeDiskBytes())) thermal=\(thermal)"
+    }
+
+    func heartbeat() {
+        let state: String
+        switch UIApplication.shared.applicationState {
+        case .active: state = "active"
+        case .inactive: state = "inactive"
+        case .background: state = "BACKGROUND"
+        @unknown default: state = "?"
+        }
+        log("\u{2665} [\(stage)] \(memorySnapshot()) app=\(state)")
+    }
+
+    func log(_ text: String) {
+        guard !text.isEmpty else { return }
+        let stamp = stampFormatter.string(from: Date())
+        var added = false
+        for raw in text.split(separator: "\n", omittingEmptySubsequences: true) {
+            let line = "\(stamp) \(raw)"
+            appendToFile(line + "\n")
+            lines.append(ConsoleLine(id: nextID, text: line))
+            nextID += 1
+            added = true
+        }
+        if added, lines.count > uiLimit { lines.removeFirst(lines.count - uiLimit) }
+    }
+
+    func setStage(_ newStage: String) {
+        stage = newStage
+        hactool_set_stage(newStage)
+        if sessionActive { writeMarker() }
+    }
+
+    func beginSession(_ info: String) {
+        sessionInfo = info
+        sessionActive = true
+        writeMarker()
+        log("=== run started: \(info)")
+    }
+
+    func endSession(_ outcome: String) {
+        sessionActive = false
+        try? FileManager.default.removeItem(at: markerURL)
+        log("=== run \(outcome)")
+    }
+
+    func clearView() { lines.removeAll() }
+    func dismissInterrupted() { interruptedSummary = nil }
+    func copyText() -> String { lines.map(\.text).joined(separator: "\n") }
+
+    private func writeMarker() {
+        try? "\(stage)\n\(sessionInfo)\n".write(to: markerURL, atomically: true, encoding: .utf8)
+    }
+
+    private func appendToFile(_ text: String) {
+        guard fd >= 0 else { return }
+        let bytes = Array(text.utf8)
+        _ = bytes.withUnsafeBufferPointer { write(fd, $0.baseAddress, $0.count) }
+    }
+
+    private func trimFileIfNeeded() {
+        let limit = 1_024 * 1_024
+        guard let size = (try? FileManager.default.attributesOfItem(atPath: fileURL.path)[.size]) as? NSNumber,
+              size.intValue > limit,
+              let reader = try? FileHandle(forReadingFrom: fileURL) else { return }
+        let end = (try? reader.seekToEnd()) ?? 0
+        let start = end > 512 * 1_024 ? end - 512 * 1_024 : 0
+        try? reader.seek(toOffset: start)
+        let tail = (try? reader.read(upToCount: Int(end - start))) ?? Data()
+        try? reader.close()
+        try? tail.write(to: fileURL, options: .atomic)
+    }
+
+    private func loadTail() {
+        guard let reader = try? FileHandle(forReadingFrom: fileURL) else { return }
+        defer { try? reader.close() }
+        let end = (try? reader.seekToEnd()) ?? 0
+        let start = end > 64 * 1_024 ? end - 64 * 1_024 : 0
+        try? reader.seek(toOffset: start)
+        let data = (try? reader.read(upToCount: Int(end - start))) ?? Data()
+        let tail = String(decoding: data, as: UTF8.self).split(separator: "\n", omittingEmptySubsequences: true).suffix(150)
+        for raw in tail {
+            lines.append(ConsoleLine(id: nextID, text: String(raw)))
+            nextID += 1
+        }
+    }
+
+    private func observeSystemEvents() {
+        let center = NotificationCenter.default
+        observers.append(center.addObserver(forName: UIApplication.didReceiveMemoryWarningNotification, object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor in self?.log("[WARN] MEMORY WARNING from iOS | \(self?.memorySnapshot() ?? "")") }
+        })
+        observers.append(center.addObserver(forName: UIApplication.willResignActiveNotification, object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor in self?.log("[app] resigned active (lock screen, control center or app switcher)") }
+        })
+        observers.append(center.addObserver(forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor in self?.log("[WARN] app entered BACKGROUND: iOS can suspend or kill it now") }
+        })
+        observers.append(center.addObserver(forName: UIApplication.willEnterForegroundNotification, object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor in self?.log("[app] returning to foreground") }
+        })
+        observers.append(center.addObserver(forName: UIApplication.willTerminateNotification, object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor in self?.log("[WARN] app is terminating") }
+        })
+        observers.append(center.addObserver(forName: ProcessInfo.thermalStateDidChangeNotification, object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor in self?.log("[WARN] thermal state changed | \(self?.memorySnapshot() ?? "")") }
+        })
+    }
+}
+
 @MainActor
 final class Extractor: ObservableObject {
-    @Published var status = "Pick a game dump and your prod.keys."
-    @Published var log = ""
+    @Published var status = "Pick a game dump and your prod.keys." {
+        didSet {
+            guard status != oldValue else { return }
+            console.log("[status] \(status)")
+            console.setStage(status)
+        }
+    }
     @Published var isRunning = false
     @Published var outputs: [URL] = []
     @Published var outputFolder: URL?
 
+    let console = ConsoleLog.shared
     private let fm = FileManager.default
+
+    init() {
+        purgeStaleWorkDirectories()
+    }
+
+    private func purgeStaleWorkDirectories() {
+        let launched = Date()
+        Task.detached(priority: .utility) {
+            let fm = FileManager.default
+            let items = (try? fm.contentsOfDirectory(at: fm.temporaryDirectory, includingPropertiesForKeys: [.creationDateKey])) ?? []
+            var removed = 0
+            for url in items where url.lastPathComponent.hasPrefix("work-") {
+                let created = (try? url.resourceValues(forKeys: [.creationDateKey]))?.creationDate ?? .distantPast
+                guard created < launched else { continue }
+                if (try? fm.removeItem(at: url)) != nil { removed += 1 }
+            }
+            if removed > 0 {
+                await ConsoleLog.shared.log("Removed \(removed) leftover work folder(s) from an earlier interrupted run.")
+            }
+        }
+    }
 
     // MARK: - Public entry point
 
@@ -23,8 +277,12 @@ final class Extractor: ObservableObject {
         isRunning = true
         outputs = []
         outputFolder = nil
-        log = ""
-        defer { isRunning = false }
+        UIApplication.shared.isIdleTimerDisabled = true
+        defer {
+            UIApplication.shared.isIdleTimerDisabled = false
+            isRunning = false
+        }
+        console.beginSession("game=\(game.lastPathComponent) update=\(update?.lastPathComponent ?? "none")")
 
         let gameScoped = game.startAccessingSecurityScopedResource()
         let updateScoped = update?.startAccessingSecurityScopedResource() ?? false
@@ -40,15 +298,27 @@ final class Extractor: ObservableObject {
 
         do {
             try await extract(game: game, update: update, keys: keys, work: work)
+            console.endSession("completed")
         } catch {
             status = "Failed: \(error.localizedDescription)"
-            append("\n[ERROR] \(error.localizedDescription)\n")
+            append("[ERROR] \(error.localizedDescription)")
+            console.endSession("failed")
         }
     }
 
     // MARK: - Pipeline
 
     private func extract(game: URL, update: URL?, keys: URL, work: URL) async throws {
+        let gameBytes = Int64(size(game))
+        let updateBytes = update.map { Int64(size($0)) } ?? 0
+        append("Game: \(game.lastPathComponent) (\(ConsoleLog.bytes(gameBytes)))")
+        if let update { append("Update: \(update.lastPathComponent) (\(ConsoleLog.bytes(updateBytes)))") }
+        append("Start: \(console.memorySnapshot())")
+        let freeBytes = console.freeDiskBytes()
+        if freeBytes >= 0, freeBytes < (gameBytes + updateBytes) * 2 {
+            append("[WARN] Only \(ConsoleLog.bytes(freeBytes)) free; extraction needs roughly 2x the input size.")
+        }
+
         // 1. HOME with .switch/prod.keys (hactool looks there, and for title.keys)
         status = "Preparing keys…"
         let home = work.appendingPathComponent("home")
@@ -84,14 +354,14 @@ final class Extractor: ObservableObject {
                     let t = try TicketParser.parse(try Data(contentsOf: tik))
                     lines.append("\(t.rightsID) = \(t.titleKey)")
                 } catch {
-                    append("[WARN] \(tik.lastPathComponent): \(error.localizedDescription)\n")
+                    append("[WARN] \(tik.lastPathComponent): \(error.localizedDescription)")
                 }
             }
         }
         if !lines.isEmpty {
             try (lines.joined(separator: "\n") + "\n")
                 .write(to: switchDir.appendingPathComponent("title.keys"), atomically: true, encoding: .utf8)
-            append("Loaded \(lines.count) title key(s) from tickets.\n")
+            append("Loaded \(lines.count) title key(s) from tickets.")
         }
 
         // 4. Locate the Program NCA(s)
@@ -108,7 +378,7 @@ final class Extractor: ObservableObject {
             targetProgram = upd
             basePath = baseProgram.url.path
         }
-        append("Program NCA: \(targetProgram.url.lastPathComponent)  (Title ID \(targetProgram.titleID))\n")
+        append("Program NCA: \(targetProgram.url.lastPathComponent)  (Title ID \(targetProgram.titleID))")
 
         // 5. Extract ExeFS + RomFS
         status = "Extracting ExeFS and RomFS… (this can take a while)"
@@ -119,7 +389,6 @@ final class Extractor: ObservableObject {
         if let basePath { args.append("--basenca=\(basePath)") }
         args.append(targetProgram.url.path)
         let r = await runHactool(args, stage: "Extracting Program NCA", home: home, logURL: logURL)
-        append(trimmed(r.log))
         guard r.code == 0 else { throw ExtractionError("hactool failed while extracting the Program NCA (exit \(r.code)). See log.") }
 
         let mainFile = exefsDir.appendingPathComponent("main")
@@ -134,7 +403,7 @@ final class Extractor: ObservableObject {
                                    "--uncompressed=\(uncompressed.path)", mainFile.path],
                                   stage: "Decompressing main NSO", home: home, logURL: logURL)
         if r2.code != 0 || !fm.fileExists(atPath: uncompressed.path) {
-            append("[WARN] Could not produce an uncompressed main.\n")
+            append("[WARN] Could not produce an uncompressed main.")
         }
 
         // 7. Find global-metadata.dat
@@ -169,49 +438,27 @@ final class Extractor: ObservableObject {
         status = "Done. Files are in Files › On My iPhone › RuinaExtractor › Extracted."
     }
 
-    private func runHactool(_ args: [String], stage: String, home: URL, logURL: URL) async -> HactoolRunner.Result {
-        recordDiagnostic(stage, event: "start")
+    private func runHactool(_ args: [String], stage: String, home: URL, logURL: URL, echo: Bool = true) async -> HactoolRunner.Result {
+        try? fm.removeItem(at: logURL)
+        console.setStage(stage)
+        console.log("\u{25B6} \(stage)")
+        console.heartbeat()
+        let tailer = LogTailer(url: logURL)
         let monitor = Task { @MainActor [weak self] in
+            var ticks = 0
             while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 2_000_000_000)
+                try? await Task.sleep(nanoseconds: 500_000_000)
                 guard !Task.isCancelled, let self else { break }
-                self.recordDiagnostic(stage, event: "heartbeat")
+                if echo { self.console.log(tailer.readNew()) }
+                ticks += 1
+                if ticks % 6 == 0 { self.console.heartbeat() }
             }
         }
         let result = await HactoolRunner.run(args, home: home, logURL: logURL)
         monitor.cancel()
-        recordDiagnostic(stage, event: "end exit=\(result.code)")
+        if echo { console.log(tailer.flush()) }
+        console.log("\u{25A0} \(stage) exit=\(result.code) | \(console.memorySnapshot())")
         return result
-    }
-
-    private func recordDiagnostic(_ stage: String, event: String) {
-        let documents = fm.urls(for: .documentDirectory, in: .userDomainMask)[0]
-        let url = documents.appendingPathComponent("RuinaExtractor-diagnostics.log")
-        let rss = hactool_process_resident_memory()
-        let line = "\(Date().timeIntervalSince1970) stage=\(stage) event=\(event) resident_bytes=\(rss)\n"
-        let limit = 256 * 1024
-
-        if let attributes = try? fm.attributesOfItem(atPath: url.path),
-           let size = attributes[.size] as? NSNumber,
-           size.intValue > limit,
-           let reader = try? FileHandle(forReadingFrom: url) {
-            let end = (try? reader.seekToEnd()) ?? 0
-            let start = end > 128 * 1024 ? end - 128 * 1024 : 0
-            try? reader.seek(toOffset: start)
-            let tail = (try? reader.read(upToCount: Int(end - start))) ?? Data()
-            try? reader.close()
-            try? tail.write(to: url, options: .atomic)
-        }
-
-        if !fm.fileExists(atPath: url.path) {
-            try? Data().write(to: url, options: .atomic)
-        }
-        if let handle = try? FileHandle(forWritingTo: url) {
-            defer { try? handle.close() }
-            try? handle.seekToEnd()
-            try? handle.write(contentsOf: Data(line.utf8))
-            try? handle.synchronize()
-        }
     }
 
     // MARK: - Steps
@@ -226,7 +473,6 @@ final class Extractor: ObservableObject {
             args = ["-k", keys.path, "--disablekeywarns", "-t", "pfs0", "--pfs0dir=\(dir.path)", url.path]
         }
         let r = await runHactool(args, stage: "Unpacking \(url.lastPathComponent)", home: home, logURL: logURL)
-        append(trimmed(r.log))
         guard r.code == 0 else { throw ExtractionError("hactool failed to unpack \(url.lastPathComponent) (exit \(r.code)).") }
         guard !files(in: dir, ext: "nca").isEmpty else {
             throw ExtractionError("No NCA files were found inside \(url.lastPathComponent).")
@@ -256,12 +502,13 @@ final class Extractor: ObservableObject {
             .prefix(8)
         for nca in candidates {
             let r = await runHactool(["-k", keys.path, "--disablekeywarns", "-t", "nca", nca.path],
-                                     stage: "Inspecting \(nca.lastPathComponent)", home: home, logURL: logURL)
+                                     stage: "Inspecting \(nca.lastPathComponent)", home: home, logURL: logURL, echo: false)
             var type: String?, tid: String?
             for line in r.log.split(separator: "\n") {
                 if line.hasPrefix("Content Type:") { type = line.dropFirst("Content Type:".count).trimmingCharacters(in: .whitespaces) }
                 if line.hasPrefix("Title ID:") { tid = line.dropFirst("Title ID:".count).trimmingCharacters(in: .whitespaces) }
             }
+            append("  \(nca.lastPathComponent): \(type ?? "unknown type"), \(ConsoleLog.bytes(Int64(size(nca))))")
             if type == "Program", let tid { return ProgramNCA(url: nca, titleID: tid) }
         }
         return nil
@@ -284,9 +531,5 @@ final class Extractor: ObservableObject {
         return nil
     }
 
-    private func append(_ text: String) { log += text }
-
-    private func trimmed(_ text: String) -> String {
-        text.count > 12000 ? "…\n" + text.suffix(12000) : text
-    }
+    private func append(_ text: String) { console.log(text) }
 }

@@ -51,15 +51,12 @@ struct ContentView: View {
                     }
                 }
 
-                if !extractor.log.isEmpty {
-                    Section("hactool log") {
-                        ScrollView(.horizontal) {
-                            Text(extractor.log)
-                                .font(.system(size: 11, design: .monospaced))
-                                .textSelection(.enabled)
-                        }
-                        .frame(maxHeight: 300)
-                    }
+                Section {
+                    ConsoleView(console: extractor.console)
+                } header: {
+                    Text("Console")
+                } footer: {
+                    Text("Also saved to Files \u{203A} On My iPhone \u{203A} RuinaExtractor \u{203A} RuinaExtractor-console.log")
                 }
 
                 Section {
@@ -102,5 +99,71 @@ struct ContentView: View {
             }
         }
         .disabled(extractor.isRunning)
+    }
+}
+
+struct ConsoleView: View {
+    @ObservedObject var console: ConsoleLog
+    @State private var follow = true
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            if let summary = console.interruptedSummary {
+                VStack(alignment: .leading, spacing: 6) {
+                    Label(summary, systemImage: "exclamationmark.triangle.fill")
+                        .font(.footnote)
+                        .foregroundStyle(.orange)
+                    Button("Dismiss") { console.dismissInterrupted() }
+                        .font(.footnote)
+                        .buttonStyle(.borderless)
+                }
+            }
+
+            ScrollViewReader { proxy in
+                ScrollView([.vertical, .horizontal]) {
+                    LazyVStack(alignment: .leading, spacing: 1) {
+                        ForEach(console.lines) { line in
+                            Text(line.text)
+                                .font(.system(size: 10, design: .monospaced))
+                                .foregroundStyle(color(for: line.text))
+                                .fixedSize(horizontal: true, vertical: false)
+                                .id(line.id)
+                        }
+                    }
+                    .padding(6)
+                }
+                .frame(height: 320)
+                .background(Color.secondary.opacity(0.12))
+                .clipShape(RoundedRectangle(cornerRadius: 8))
+                .onChange(of: console.lines.last?.id) { id in
+                    if follow, let id { proxy.scrollTo(id, anchor: .bottom) }
+                }
+            }
+
+            HStack(spacing: 14) {
+                Button { UIPasteboard.general.string = console.copyText() } label: {
+                    Label("Copy", systemImage: "doc.on.doc")
+                }
+                ShareLink(item: console.fileURL) {
+                    Label("Share log", systemImage: "square.and.arrow.up")
+                }
+                Button(role: .destructive) { console.clearView() } label: {
+                    Label("Clear", systemImage: "trash")
+                }
+            }
+            .font(.footnote)
+            .buttonStyle(.borderless)
+
+            Toggle("Follow latest", isOn: $follow)
+                .font(.footnote)
+        }
+    }
+
+    private func color(for text: String) -> Color {
+        if text.contains("[CRASH]") || text.contains("[ERROR]") || text.contains("ended unexpectedly") { return .red }
+        if text.contains("[WARN]") { return .orange }
+        if text.contains("\u{2665}") { return .secondary }
+        if text.contains("\u{25B6}") || text.contains("\u{25A0}") || text.contains("===") { return .blue }
+        return .primary
     }
 }
