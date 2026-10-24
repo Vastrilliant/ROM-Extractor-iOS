@@ -319,6 +319,12 @@ static void nca_compression_fail(nca_section_ctx_t *ctx, const char *message) {
     exit(EXIT_FAILURE);
 }
 
+static void nca_compression_hex(const char *label, const unsigned char *p, size_t n) {
+    fprintf(stderr, "  %s:", label);
+    for (size_t i = 0; i < n; i++) fprintf(stderr, "%s%02x", (i % 16 == 0) ? " " : "", p[i]);
+    fprintf(stderr, "\n");
+}
+
 static void nca_compression_init(nca_section_ctx_t *ctx) {
     nca_compression_ctx_t *c = &ctx->compression;
     const unsigned char *info = ctx->header->_0x148 + NCA_COMPRESSION_INFO_OFFSET;
@@ -356,12 +362,14 @@ static void nca_compression_init(nca_section_ctx_t *ctx) {
 
     uint64_t virtual_size = nca_le64(table + 8);
     uint32_t loaded = 0;
+    uint64_t bad_set = 0;
     const char *error = NULL;
     for (uint64_t set = 0; set < entry_sets && error == NULL; set++) {
         const unsigned char *node = table + node_storage + set * NCA_COMPRESSION_NODE_SIZE;
         uint32_t count = nca_le32(node + 4);
         if (count == 0 || count > entries_per_node || count > entry_count - loaded) {
             error = "entry set has an invalid entry count";
+            bad_set = set;
             break;
         }
         for (uint32_t i = 0; i < count; i++) {
@@ -373,12 +381,22 @@ static void nca_compression_init(nca_section_ctx_t *ctx) {
             entry->physical_size = nca_le32(raw + 0x14);
         }
     }
-    free(table);
     if (error == NULL && loaded != entry_count) error = "entry sets do not contain every entry";
+    if (error != NULL) {
+        fprintf(stderr, "NCA compression diagnostics: table_offset=0x%"PRIx64" table_size=0x%"PRIx64" entry_count=%u entry_sets=%"PRIu64" node_storage=0x%"PRIx64" entry_storage=0x%"PRIx64" failed_set=%"PRIu64" loaded=%u\n",
+            table_offset, table_size, entry_count, entry_sets, node_storage, entry_storage, bad_set, loaded);
+        nca_compression_hex("table head", table, 0x30);
+        nca_compression_hex("first entry set", table + node_storage, 0x30);
+        nca_compression_hex("failed entry set", table + node_storage + bad_set * NCA_COMPRESSION_NODE_SIZE, 0x30);
+        nca_compression_hex("table tail", table + needed - 0x20, 0x20);
+    }
+    free(table);
     if (error == NULL && (virtual_size == 0 || c->entries[0].virtual_offset != 0)) error = "table does not start at virtual offset 0";
 
+    uint32_t bad_entry = 0;
     for (uint32_t i = 0; i < entry_count && error == NULL; i++) {
         const nca_compression_entry_t *entry = &c->entries[i];
+        bad_entry = i;
         uint64_t end = i + 1 < entry_count ? c->entries[i + 1].virtual_offset : virtual_size;
         if (end <= entry->virtual_offset || end > virtual_size) {
             error = "entries are not strictly increasing";
@@ -392,6 +410,9 @@ static void nca_compression_init(nca_section_ctx_t *ctx) {
         }
     }
     if (error != NULL) {
+        const nca_compression_entry_t *e = &c->entries[bad_entry];
+        fprintf(stderr, "NCA compression diagnostics: virtual_size=0x%"PRIx64" entry=%u virtual_offset=0x%"PRIx64" physical_offset=0x%"PRIx64" physical_size=0x%x type=%u\n",
+            virtual_size, bad_entry, e->virtual_offset, e->physical_offset, e->physical_size, e->type);
         nca_compression_free(ctx);
         nca_compression_fail(ctx, error);
     }
