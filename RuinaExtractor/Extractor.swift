@@ -384,12 +384,29 @@ final class Extractor: ObservableObject {
         status = "Extracting ExeFS and RomFS… (this can take a while)"
         let exefsDir = work.appendingPathComponent("exefs")
         let romfsDir = work.appendingPathComponent("romfs")
-        var args = ["-k", keysCopy.path, "--disablekeywarns", "-t", "nca",
-                    "--exefsdir=\(exefsDir.path)", "--romfsdir=\(romfsDir.path)"]
-        if let basePath { args.append("--basenca=\(basePath)") }
-        args.append(targetProgram.url.path)
-        let r = await runHactool(args, stage: "Extracting Program NCA", home: home, logURL: logURL)
-        guard r.code == 0 else { throw ExtractionError("hactool failed while extracting the Program NCA (exit \(r.code)). See log.") }
+        // 5a. ExeFS only. This is a plain PFS0 section, so it must not depend on RomFS
+        //     (patched updates have a compressed BKTR RomFS that can fail to parse).
+        let exeArgs = ["-k", keysCopy.path, "--disablekeywarns", "-t", "nca",
+                       "--exefsdir=\(exefsDir.path)", targetProgram.url.path]
+        let r = await runHactool(exeArgs, stage: "Extracting ExeFS", home: home, logURL: logURL)
+        guard r.code == 0 else { throw ExtractionError("hactool failed while extracting ExeFS (exit \(r.code)). See log.") }
+
+        // 5b. RomFS is best-effort for updates: try update+base first, then fall back to the base RomFS.
+        var romfsNote = ""
+        var rargs = ["-k", keysCopy.path, "--disablekeywarns", "-t", "nca", "--romfsdir=\(romfsDir.path)"]
+        if let basePath { rargs.append("--basenca=\(basePath)") }
+        rargs.append(targetProgram.url.path)
+        let rr = await runHactool(rargs, stage: "Extracting RomFS", home: home, logURL: logURL)
+        if rr.code != 0 && updateDir != nil {
+            append("[WARN] Update RomFS could not be extracted; falling back to the BASE game's RomFS (metadata may be older than the update).")
+            try? fm.removeItem(at: romfsDir)
+            let bargs = ["-k", keysCopy.path, "--disablekeywarns", "-t", "nca",
+                         "--romfsdir=\(romfsDir.path)", baseProgram.url.path]
+            let br = await runHactool(bargs, stage: "Extracting base RomFS", home: home, logURL: logURL)
+            romfsNote = br.code == 0 ? "base-romfs" : "no-romfs"
+        } else if rr.code != 0 {
+            romfsNote = "no-romfs"
+        }
 
         let mainFile = exefsDir.appendingPathComponent("main")
         guard fm.fileExists(atPath: mainFile.path) else {
@@ -407,9 +424,8 @@ final class Extractor: ObservableObject {
         }
 
         // 7. Find global-metadata.dat
-        guard let metadata = find(named: "global-metadata.dat", under: romfsDir) else {
-            throw ExtractionError("Extraction finished but global-metadata.dat wasn't found in RomFS. Is this an IL2CPP build?")
-        }
+        let metadata = find(named: "global-metadata.dat", under: romfsDir)
+        if metadata == nil { append("[WARN] global-metadata.dat not found (\(romfsNote)). Continuing with ExeFS only.") }
 
         // 8. Copy results into Documents/Extracted/<TitleID>
         status = "Saving results…"
@@ -419,8 +435,10 @@ final class Extractor: ObservableObject {
         try fm.createDirectory(at: out, withIntermediateDirectories: true)
 
         var results: [URL] = []
-        let metaOut = out.appendingPathComponent("global-metadata.dat")
-        try fm.copyItem(at: metadata, to: metaOut); results.append(metaOut)
+        if let metadata {
+            let metaOut = out.appendingPathComponent("global-metadata.dat")
+            try fm.copyItem(at: metadata, to: metaOut); results.append(metaOut)
+        }
 
         let exefsOut = out.appendingPathComponent("exefs")
         try fm.copyItem(at: exefsDir, to: exefsOut)
