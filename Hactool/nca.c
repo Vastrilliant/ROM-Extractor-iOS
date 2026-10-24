@@ -1137,7 +1137,13 @@ static void nca_validate_romfs_layout(const romfs_hdr_t *header, uint64_t region
         }
     }
     if (!valid) {
-        fprintf(stderr, "Invalid %s RomFS metadata layout!\n", label);
+        fprintf(stderr, "Invalid %s RomFS metadata layout! region_size=0x%"PRIx64" header_size=0x%"PRIx64" dir_hash=0x%"PRIx64"+0x%"PRIx64" dir_meta=0x%"PRIx64"+0x%"PRIx64" file_hash=0x%"PRIx64"+0x%"PRIx64" file_meta=0x%"PRIx64"+0x%"PRIx64" data_offset=0x%"PRIx64"\n",
+            label, region_size, header->header_size,
+            header->dir_hash_table_offset, header->dir_hash_table_size,
+            header->dir_meta_table_offset, header->dir_meta_table_size,
+            header->file_hash_table_offset, header->file_hash_table_size,
+            header->file_meta_table_offset, header->file_meta_table_size,
+            header->data_offset);
         exit(EXIT_FAILURE);
     }
 }
