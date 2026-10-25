@@ -474,6 +474,24 @@ final class Extractor: ObservableObject {
         let npdm = exefsOut.appendingPathComponent("main.npdm")
         if fm.fileExists(atPath: npdm.path) { results.append(npdm) }
 
+        status = "Saving RomFS Data folder…"
+        let topLevel = (try? fm.contentsOfDirectory(at: romfsDir, includingPropertiesForKeys: nil)) ?? []
+        if let dataDir = topLevel.first(where: { $0.lastPathComponent.lowercased() == "data" }) {
+            let dataOut = out.appendingPathComponent("Data")
+            do {
+                try fm.moveItem(at: dataDir, to: dataOut)
+            } catch {
+                append("[WARN] Move of Data folder failed (\(error.localizedDescription)); copying instead.")
+                try fm.copyItem(at: dataDir, to: dataOut)
+            }
+            results.append(dataOut)
+            let count = fm.enumerator(at: dataOut, includingPropertiesForKeys: nil)?.allObjects.count ?? 0
+            append("Saved RomFS Data folder (\(count) items).")
+        } else {
+            append("[WARN] No Data folder found at the top level of the RomFS (\(romfsNote)).")
+        }
+
+        status = "Saving results…"
         if fm.fileExists(atPath: uncompressed.path) {
             let u = out.appendingPathComponent("main.uncompressed")
             try fm.copyItem(at: uncompressed, to: u); results.append(u)
