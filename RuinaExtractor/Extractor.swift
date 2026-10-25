@@ -444,6 +444,11 @@ final class Extractor: ObservableObject {
         // 7. Find global-metadata.dat
         let metadata = find(named: "global-metadata.dat", under: romfsDir)
         if metadata == nil { append("[WARN] global-metadata.dat not found (\(romfsNote)). Continuing with ExeFS only.") }
+        let unityFiles = ["globalgamemanagers", "boot.config"].compactMap { name -> URL? in
+            let found = find(named: name, under: romfsDir)
+            if found == nil { append("[WARN] \(name) not found in the RomFS (\(romfsNote)).") }
+            return found
+        }
 
         // 8. Copy results into Documents/Extracted/<TitleID>
         status = "Saving results…"
@@ -456,6 +461,11 @@ final class Extractor: ObservableObject {
         if let metadata {
             let metaOut = out.appendingPathComponent("global-metadata.dat")
             try fm.copyItem(at: metadata, to: metaOut); results.append(metaOut)
+        }
+
+        for src in unityFiles {
+            let dst = out.appendingPathComponent(src.lastPathComponent)
+            try fm.copyItem(at: src, to: dst); results.append(dst)
         }
 
         let exefsOut = out.appendingPathComponent("exefs")
