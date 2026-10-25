@@ -333,11 +333,6 @@ final class Extractor: ObservableObject {
         try keysData.write(to: keysCopy)
         let logURL = work.appendingPathComponent("hactool.log")
 
-        // 2. Unpack the container(s) into NCAs (+ tickets for NSPs)
-        status = "Unpacking \(game.lastPathComponent)… (this can take a while)"
-        let baseDir = work.appendingPathComponent("base")
-        try await unpackContainer(game, into: baseDir, keys: keysCopy, home: home, logURL: logURL)
-
         var updateDir: URL?
         if let update {
             status = "Unpacking \(update.lastPathComponent)…"
@@ -346,9 +341,12 @@ final class Extractor: ObservableObject {
             updateDir = dir
         }
 
-        // 3. Tickets -> title.keys (needed for NSP contents using rights-ID crypto)
+        status = "Unpacking \(game.lastPathComponent)… (this can take a while)"
+        let baseDir = work.appendingPathComponent("base")
+        try await unpackContainer(game, into: baseDir, keys: keysCopy, home: home, logURL: logURL)
+
         var lines: [String] = []
-        for dir in [baseDir, updateDir].compactMap({ $0 }) {
+        for dir in [updateDir, baseDir].compactMap({ $0 }) {
             for tik in files(in: dir, ext: "tik") {
                 do {
                     let t = try TicketParser.parse(try Data(contentsOf: tik))
@@ -364,54 +362,74 @@ final class Extractor: ObservableObject {
             append("Loaded \(lines.count) title key(s) from tickets.")
         }
 
-        // 4. Locate the Program NCA(s)
         status = "Locating the Program NCA…"
-        guard let baseProgram = try await findProgramNCA(in: baseDir, keys: keysCopy, home: home, logURL: logURL) else {
-            throw ExtractionError("No Program NCA found in the game file. Check that prod.keys is new enough for this dump (master key / keygen revision).")
-        }
-        var targetProgram = baseProgram
-        var basePath: String?
+        var updateProgram: ProgramNCA?
         if let updateDir {
-            guard let upd = try await findProgramNCA(in: updateDir, keys: keysCopy, home: home, logURL: logURL) else {
-                throw ExtractionError("No Program NCA found in the update file.")
+            updateProgram = try await findProgramNCA(in: updateDir, keys: keysCopy, home: home, logURL: logURL)
+            if updateProgram == nil {
+                append("[WARN] No Program NCA found in the update file. Check its title key / ticket. Using the BASE game instead.")
             }
-            targetProgram = upd
-            basePath = baseProgram.url.path
         }
-        append("Program NCA: \(targetProgram.url.lastPathComponent)  (Title ID \(targetProgram.titleID))")
+        let baseProgram = try await findProgramNCA(in: baseDir, keys: keysCopy, home: home, logURL: logURL)
+        if baseProgram == nil && updateProgram == nil {
+            throw ExtractionError("No Program NCA found in the game or update file. Check that prod.keys is new enough for this dump (master key / keygen revision).")
+        }
+        if baseProgram == nil {
+            append("[WARN] No Program NCA found in the base game, so the update's patch RomFS has nothing to patch against.")
+        }
 
-        // 5. Extract ExeFS + RomFS
         status = "Extracting ExeFS and RomFS… (this can take a while)"
         let exefsDir = work.appendingPathComponent("exefs")
         let romfsDir = work.appendingPathComponent("romfs")
-        // 5a. ExeFS only. This is a plain PFS0 section, so it must not depend on RomFS
-        //     (patched updates have a compressed BKTR RomFS that can fail to parse).
-        let exeArgs = ["-k", keysCopy.path, "--disablekeywarns", "-t", "nca",
-                       "--exefsdir=\(exefsDir.path)", targetProgram.url.path]
-        let r = await runHactool(exeArgs, stage: "Extracting ExeFS", home: home, logURL: logURL)
-        guard r.code == 0 else { throw ExtractionError("hactool failed while extracting ExeFS (exit \(r.code)). See log.") }
+        let mainCheck = exefsDir.appendingPathComponent("main")
 
-        // 5b. RomFS is best-effort for updates: try update+base first, then fall back to the base RomFS.
-        var romfsNote = ""
-        var rargs = ["-k", keysCopy.path, "--disablekeywarns", "-t", "nca", "--romfsdir=\(romfsDir.path)"]
-        if let basePath { rargs.append("--basenca=\(basePath)") }
-        rargs.append(targetProgram.url.path)
-        let rr = await runHactool(rargs, stage: "Extracting RomFS", home: home, logURL: logURL)
-        if rr.code != 0 && updateDir != nil {
-            append("[WARN] Update RomFS could not be extracted; falling back to the BASE game's RomFS (metadata may be older than the update).")
-            try? fm.removeItem(at: romfsDir)
-            let bargs = ["-k", keysCopy.path, "--disablekeywarns", "-t", "nca",
-                         "--romfsdir=\(romfsDir.path)", baseProgram.url.path]
-            let br = await runHactool(bargs, stage: "Extracting base RomFS", home: home, logURL: logURL)
-            romfsNote = br.code == 0 ? "base-romfs" : "no-romfs"
-        } else if rr.code != 0 {
-            romfsNote = "no-romfs"
+        var exefsProgram: ProgramNCA?
+        if let upd = updateProgram {
+            let ok = await extractSection(flag: "--exefsdir", nca: upd.url, into: exefsDir, baseNCA: baseProgram?.url,
+                                          allowWithoutBase: true, stage: "Extracting update ExeFS", keys: keysCopy, home: home, logURL: logURL)
+            if ok && fm.fileExists(atPath: mainCheck.path) {
+                exefsProgram = upd
+            } else {
+                append("[WARN] Update ExeFS could not be extracted; falling back to the BASE game's ExeFS.")
+            }
+        }
+        if exefsProgram == nil, let base = baseProgram {
+            let ok = await extractSection(flag: "--exefsdir", nca: base.url, into: exefsDir, baseNCA: nil,
+                                          allowWithoutBase: true, stage: "Extracting base ExeFS", keys: keysCopy, home: home, logURL: logURL)
+            if ok && fm.fileExists(atPath: mainCheck.path) { exefsProgram = base }
+        }
+        guard let targetProgram = exefsProgram else {
+            throw ExtractionError("hactool failed while extracting ExeFS from both the update and the base game. See log.")
+        }
+        let exefsFromUpdate = updateProgram != nil && targetProgram.url == updateProgram?.url
+
+        var romfsNote = "no-romfs"
+        if let upd = updateProgram {
+            let ok = await extractSection(flag: "--romfsdir", nca: upd.url, into: romfsDir, baseNCA: baseProgram?.url,
+                                          allowWithoutBase: false, stage: "Extracting update RomFS", keys: keysCopy, home: home, logURL: logURL)
+            if ok {
+                romfsNote = "update-romfs"
+            } else {
+                append("[WARN] Update RomFS could not be extracted; falling back to the BASE game's RomFS (metadata may be older than the update).")
+            }
+        }
+        if romfsNote == "no-romfs", let base = baseProgram {
+            let ok = await extractSection(flag: "--romfsdir", nca: base.url, into: romfsDir, baseNCA: nil,
+                                          allowWithoutBase: true, stage: "Extracting base RomFS", keys: keysCopy, home: home, logURL: logURL)
+            if ok { romfsNote = "base-romfs" }
+        }
+
+        append("Program NCA: \(targetProgram.url.lastPathComponent)  (Title ID \(targetProgram.titleID))")
+        append("ExeFS source: \(exefsFromUpdate ? "update" : "base")  |  RomFS source: \(romfsNote)")
+        if updateDir != nil && !exefsFromUpdate {
+            append("[WARN] ExeFS came from the BASE game, so its build ID will not match the updated game.")
         }
 
         let mainFile = exefsDir.appendingPathComponent("main")
         guard fm.fileExists(atPath: mainFile.path) else {
             throw ExtractionError("ExeFS was extracted but contains no 'main'. See log.")
         }
+        if let id = buildID(of: mainFile) { append("main build ID: \(id)") }
 
         // 6. Decompress main (NSO) for IL2CPP tooling
         status = "Decompressing main…"
@@ -430,7 +448,7 @@ final class Extractor: ObservableObject {
         // 8. Copy results into Documents/Extracted/<TitleID>
         status = "Saving results…"
         let docs = fm.urls(for: .documentDirectory, in: .userDomainMask)[0]
-        let out = docs.appendingPathComponent("Extracted/\(targetProgram.titleID)\(updateDir != nil ? "-patched" : "")")
+        let out = docs.appendingPathComponent("Extracted/\(targetProgram.titleID)\(exefsFromUpdate ? "-patched" : "")")
         try? fm.removeItem(at: out)
         try fm.createDirectory(at: out, withIntermediateDirectories: true)
 
@@ -495,6 +513,34 @@ final class Extractor: ObservableObject {
         guard !files(in: dir, ext: "nca").isEmpty else {
             throw ExtractionError("No NCA files were found inside \(url.lastPathComponent).")
         }
+    }
+
+    private func extractSection(flag: String, nca: URL, into dir: URL, baseNCA: URL?, allowWithoutBase: Bool,
+                                stage: String, keys: URL, home: URL, logURL: URL) async -> Bool {
+        var variants: [[String]] = []
+        if let baseNCA { variants.append(["--basenca=\(baseNCA.path)"]) }
+        if baseNCA == nil || allowWithoutBase { variants.append([]) }
+        for (index, extra) in variants.enumerated() {
+            try? fm.removeItem(at: dir)
+            let args = ["-k", keys.path, "--disablekeywarns", "-t", "nca"] + extra + ["\(flag)=\(dir.path)", nca.path]
+            let label = index == 0 ? stage : "\(stage) (retry without base NCA)"
+            let r = await runHactool(args, stage: label, home: home, logURL: logURL)
+            if r.code == 0 && hasContent(dir) { return true }
+        }
+        try? fm.removeItem(at: dir)
+        return false
+    }
+
+    private func hasContent(_ dir: URL) -> Bool {
+        guard let e = fm.enumerator(at: dir, includingPropertiesForKeys: nil) else { return false }
+        return e.nextObject() != nil
+    }
+
+    private func buildID(of url: URL) -> String? {
+        guard let h = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? h.close() }
+        guard (try? h.seek(toOffset: 0x40)) != nil, let d = try? h.read(upToCount: 0x20), d.count == 0x20 else { return nil }
+        return d.map { String(format: "%02X", $0) }.joined()
     }
 
     private enum ContainerKind { case xci, nsp }
