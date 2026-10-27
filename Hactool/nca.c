@@ -26,6 +26,7 @@
 
 static void nca_section_raw_fseek(nca_section_ctx_t *ctx, uint64_t offset);
 static size_t nca_section_raw_fread(nca_section_ctx_t *ctx, void *buffer, size_t count);
+static int nca_section_has_compression(const nca_section_ctx_t *ctx);
 
 /* Initialize the context. */
 void nca_init(nca_ctx_t *ctx) {
@@ -256,8 +257,16 @@ static size_t nca_section_raw_fread(nca_section_ctx_t *ctx, void *buffer, size_t
                                     break;
                                 }
                             }
-                            nca_section_fseek(&base_ctx->section_contexts[romfs_section_num], ctx->bktr_ctx.base_seek);
-                            if ((read = nca_section_fread(&base_ctx->section_contexts[romfs_section_num], buffer, count)) != count) {
+                            nca_section_ctx_t *base_sec = &base_ctx->section_contexts[romfs_section_num];
+                            /* When the patch section has an NCA compression layer, that layer sits ABOVE the
+                               BKTR storage, so relocation entries address the base section's stored
+                               (still compressed) bytes. Never decompress the base in that case. */
+                            int saved_physical = base_sec->physical_reads;
+                            if (nca_section_has_compression(ctx)) base_sec->physical_reads = 1;
+                            nca_section_fseek(base_sec, ctx->bktr_ctx.base_seek);
+                            read = nca_section_fread(base_sec, buffer, count);
+                            base_sec->physical_reads = saved_physical;
+                            if (read != count) {
                                 fprintf(stderr, "Failed to read from Base NCA RomFS!\n");
                                 exit(EXIT_FAILURE);
                             }
@@ -325,7 +334,7 @@ static void nca_compression_hex(const char *label, const unsigned char *p, size_
     fprintf(stderr, "\n");
 }
 
-static void nca_compression_init(nca_section_ctx_t *ctx, uint64_t base_offset, uint64_t region_size) {
+static void nca_compression_init(nca_section_ctx_t *ctx, uint64_t base_offset, uint64_t region_size, uint64_t section_limit) {
     nca_compression_ctx_t *c = &ctx->compression;
     const unsigned char *info = ctx->header->_0x148 + NCA_COMPRESSION_INFO_OFFSET;
     uint64_t table_offset = nca_le64(info);
@@ -340,7 +349,7 @@ static void nca_compression_init(nca_section_ctx_t *ctx, uint64_t base_offset, u
     uint64_t entry_storage = entry_sets * NCA_COMPRESSION_NODE_SIZE;
     uint64_t needed = node_storage + entry_storage;
 
-    if (base_offset > ctx->size || region_size > ctx->size - base_offset) nca_compression_fail(ctx, "data region lies outside the section");
+    if (base_offset > section_limit || region_size > section_limit - base_offset) nca_compression_fail(ctx, "data region lies outside the section");
     if (table_offset > region_size || table_size > region_size - table_offset) nca_compression_fail(ctx, "table lies outside the data region");
     if (needed > table_size || needed > NCA_COMPRESSION_MAX_TABLE_SIZE) nca_compression_fail(ctx, "table size does not match entry count");
 
@@ -353,12 +362,17 @@ static void nca_compression_init(nca_section_ctx_t *ctx, uint64_t base_offset, u
         exit(EXIT_FAILURE);
     }
 
-    nca_section_raw_fseek(ctx, base_offset + table_offset);
-    if (nca_section_raw_fread(ctx, table, (size_t)needed) != (size_t)needed) {
-        free(table);
-        nca_compression_free(ctx);
-        fprintf(stderr, "Failed to read NCA compression table!\n");
-        exit(EXIT_FAILURE);
+    for (uint64_t done = 0; done < needed; ) {
+        uint64_t chunk = needed - done;
+        if (chunk > 0x100000ULL) chunk = 0x100000ULL;
+        nca_section_raw_fseek(ctx, base_offset + table_offset + done);
+        if (nca_section_raw_fread(ctx, table + done, (size_t)chunk) != (size_t)chunk) {
+            free(table);
+            nca_compression_free(ctx);
+            fprintf(stderr, "Failed to read NCA compression table!\n");
+            exit(EXIT_FAILURE);
+        }
+        done += chunk;
     }
 
     uint64_t virtual_size = nca_le64(table + 8);
@@ -425,6 +439,8 @@ static void nca_compression_init(nca_section_ctx_t *ctx, uint64_t base_offset, u
     c->virtual_size = virtual_size;
     c->seek = 0;
     c->active = 1;
+    printf("NCA compression layer (section %u, %s): entries=%u stored_region=0x%"PRIx64" virtual_size=0x%"PRIx64" table_offset=0x%"PRIx64"\n",
+        ctx->section_num, ctx->type == BKTR ? "patch/BKTR" : "base", entry_count, region_size, virtual_size, table_offset);
 }
 
 static size_t nca_compression_find_entry(const nca_compression_ctx_t *c, uint64_t offset) {
@@ -893,7 +909,7 @@ void nca_process(nca_ctx_t *ctx) {
                 }
             }
 
-            if (nca_section_has_compression(&ctx->section_contexts[i]) && ctx->section_contexts[i].type != ROMFS) {
+            if (nca_section_has_compression(&ctx->section_contexts[i]) && ctx->section_contexts[i].type != ROMFS && ctx->section_contexts[i].type != BKTR) {
                 fprintf(stderr, "[WARN] Section %"PRId32" has a compression layer that is not supported for this section type.\n", i);
             }
 
@@ -1501,7 +1517,7 @@ void nca_process_ivfc_section(nca_section_ctx_t *ctx) {
         exit(EXIT_FAILURE);
     }
     if (nca_section_has_compression(ctx)) {
-        nca_compression_init(ctx, ctx->romfs_ctx.romfs_offset, ctx->romfs_ctx.ivfc_levels[IVFC_MAX_LEVEL - 1].data_size);
+        nca_compression_init(ctx, ctx->romfs_ctx.romfs_offset, ctx->romfs_ctx.ivfc_levels[IVFC_MAX_LEVEL - 1].data_size, ctx->size);
         ctx->romfs_ctx.ivfc_levels[IVFC_MAX_LEVEL - 1].data_size = ctx->compression.virtual_size;
     }
     nca_section_fseek(ctx, ctx->romfs_ctx.romfs_offset);
@@ -1718,6 +1734,15 @@ void nca_process_bktr_section(nca_section_ctx_t *ctx) {
 
         ctx->bktr_ctx.romfs_offset = ctx->bktr_ctx.ivfc_levels[IVFC_MAX_LEVEL - 1].data_offset;
         if (ctx->tool_ctx->base_file != NULL) {
+            if (nca_section_has_compression(ctx)) {
+                /* Compressed patch RomFS: the compression layer sits above the BKTR (patched) storage.
+                   The IVFC level size describes the stored (compressed) region; the decompressed
+                   RomFS size comes from the compression table. The BKTR virtual size bounds the region. */
+                nca_compression_init(ctx, ctx->bktr_ctx.romfs_offset,
+                    ctx->bktr_ctx.ivfc_levels[IVFC_MAX_LEVEL - 1].data_size,
+                    ctx->bktr_ctx.relocation_block->total_size);
+                ctx->bktr_ctx.ivfc_levels[IVFC_MAX_LEVEL - 1].data_size = ctx->compression.virtual_size;
+            }
             nca_section_fseek(ctx, ctx->bktr_ctx.romfs_offset);
             if (nca_section_fread(ctx, &ctx->bktr_ctx.header, sizeof(romfs_hdr_t)) != sizeof(romfs_hdr_t)) {
                 fprintf(stderr, "Failed to read BKTR Virtual RomFS header!\n");
@@ -2015,7 +2040,7 @@ void nca_save_pfs0_section(nca_section_ctx_t *ctx) {
 /* RomFS functions... */
 static int nca_is_romfs_file_updated(nca_section_ctx_t *ctx, uint64_t file_offset, uint64_t file_size) {
     /* All files in a Base RomFS are "updated". */
-    if (ctx->type == ROMFS) {
+    if (ctx->type == ROMFS || ctx->compression.active) {
         return 1;
     }
 
